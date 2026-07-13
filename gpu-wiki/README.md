@@ -99,8 +99,8 @@ Centralized hardware specification tables for all target GPUs, providing peak TF
 | [`hardware_specs_mi308x.md`](docs/hardware-specs/hardware_specs_mi308x.md) | AMD MI308X (CDNA3, gfx942) | 80 CU, 206T BF16, 5.3 TB/s, ridge ~39 |
 | [`hardware_specs_mi355x.md`](docs/hardware-specs/hardware_specs_mi355x.md) | AMD MI355X (CDNA4, gfx950) | 256 CU, 160KB LDS, ridge ~629 |
 | [`hardware_specs_hopper.md`](docs/hardware-specs/hardware_specs_hopper.md) | NVIDIA H100/H20/H200 (sm_90) | 989T BF16 (H100), 228KB smem, ridge ~295/37 |
-| [`hardware_specs_b200.md`](docs/hardware-specs/hardware_specs_b200.md) | NVIDIA B200 (GB200 / Blackwell / sm_100) | 160 SM, 2250T BF16, 8.0 TB/s, ridge ~281 |
-| [`hardware_specs_b300.md`](docs/hardware-specs/hardware_specs_b300.md) | NVIDIA B300 (GB300 / Blackwell Ultra / sm_103) | 160 SM, 2250T BF16, 8.0 TB/s, 288GB HBM3e, ridge ~281 |
+| [`hardware_specs_b200.md`](docs/hardware-specs/hardware_specs_b200.md) | NVIDIA B200 (GB200 / Blackwell / sm_100) | 148 SM, 2250T BF16, 8.0 TB/s, ridge ~281 |
+| [`hardware_specs_b300.md`](docs/hardware-specs/hardware_specs_b300.md) | NVIDIA B300 (GB300 / Blackwell Ultra / sm_103) | 148 SM, 2250T BF16, 8.0 TB/s, 288GB HBM3e, ridge ~281 |
 | [`hardware_specs_sm120.md`](docs/hardware-specs/hardware_specs_sm120.md) | NVIDIA RTX PRO 6000/5000 (sm_120) | Blackwell GeForce / RTX PRO |
 | [`hardware-comparison-cdna3-cdna4.md`](docs/hardware-specs/hardware-comparison-cdna3-cdna4.md) | Cross-architecture | CDNA3 vs CDNA4 vs RDNA4 parameter comparison |
 

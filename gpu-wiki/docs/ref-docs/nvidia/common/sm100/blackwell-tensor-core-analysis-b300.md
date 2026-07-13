@@ -9,7 +9,7 @@ An analysis of new PTX ISA 8.8 features specific to the B300 (Blackwell Ultra / 
 NVIDIA recently released PTX ISA 8.8, which likely contains information about the B300 (Blackwell Ultra) variant. Given that B200 is SM_100 and Thor is SM_102, the newly introduced SM_103 clearly corresponds to B300.
 
 NVIDIA highlights two key improvements for Blackwell Ultra:
-1. **1.5x FP4 compute throughput**
+1. **1.5x FP4 compute throughput** — scoped to the K=96 FP4 mode of 2CTA `tcgen05.mma` described in §2 below, not the datasheet peak. The full published dense FP4 peak is 15 PFLOPS on B300 vs 9 PFLOPS on B200 (**+67%**); the sparse peak ratio is 20/18 (**+11%**). See [`hardware_specs_b300.md`](../../../../hardware-specs/hardware_specs_b300.md) for the datasheet-peak roofline numbers. The two figures measure different things — do not combine them.
 2. **"New Attention Instructions"**
 
 The following sections examine the SM_103-exclusive features found in the PTX ISA.

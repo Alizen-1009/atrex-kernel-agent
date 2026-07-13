@@ -47,18 +47,18 @@ utilization = actual TFLOPS / peak TFLOPS × 100%
 | Parameter | Value |
 |------|------|
 | Graphics Processing Clusters (GPCs) | 8 |
-| Streaming Multiprocessors (SMs) | 148 (dual-die, 74 SMs per die; each die has 80 physical SMs, 74 enabled for yield optimization)  |
-| CUDA Cores | 20,480 |
-| Tensor Cores (5th gen) | 640 |
-| RT Cores (4th gen) | 160 |
-| Texture Units | 640 |
+| Streaming Multiprocessors (SMs) | 148 (dual-die, 74 SMs per die; each die has 80 physical SMs, 74 enabled for yield optimization) |
+| CUDA Cores | 18,944 |
+| Tensor Cores (5th gen) | 592 |
+| RT Cores (4th gen) | 148 |
+| Texture Units | 592 |
 | CUDA Cores per SM | 128 |
 | Tensor Cores per SM | 4 (5th gen) |
 | RT Cores per SM | 1 |
 | Register File per SM | 256 KB |
 | L1 Data Cache / Shared Memory per SM | 128 KB physical pool |
-| Total Register File | 40,960 KB |
-| Total L1 Data Cache / Shared Memory | 20,480 KB |
+| Total Register File | 37,888 KB |
+| Total L1 Data Cache / Shared Memory | 18,944 KB |
 
 ---
 
@@ -79,6 +79,8 @@ utilization = actual TFLOPS / peak TFLOPS × 100%
 | Compute Capability | 10.3 (`sm_103`) | 10.0 (`sm_100`) | Minor arch revision |
 
 > **Design Philosophy**: B300 sacrifices FP64 throughput to reallocate die area and power budget towards FP4 Tensor Core throughput (15 PFLOPS dense, +67% vs B200), making it the optimal choice for large-scale LLM inference workloads. FP32/FP16/BF16/FP8 performance remains on par with B200.
+
+> **Note on FP4 ratio scopes**: NVIDIA's public "1.5× FP4 throughput" claim (also quoted as "1.5× AI performance" for GB300 NVL72) is scoped to the K=96 FP4 mode available only in 2CTA `tcgen05.mma` on `sm_103` — see [Blackwell Tensor Core Analysis (B300)](../ref-docs/nvidia/common/sm100/blackwell-tensor-core-analysis-b300.md). The +67% figure in the table above is the ratio of published dense FP4 peak TOPS (15,000 / 9,000) and applies to the datasheet peak, not any single instruction. Do not mix the two in a single Roofline calculation; use the datasheet peak (15 PFLOPS dense) unless you can guarantee the kernel actually issues the K=96 2CTA path.
 
 ---
 
