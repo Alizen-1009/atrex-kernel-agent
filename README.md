@@ -99,7 +99,8 @@ loaded.
 ├── input.py
 ├── shapes.json
 ├── roofline.json
-└── metadata.json
+├── metadata.json
+└── kernel_v0.py       # optional existing implementation
 ```
 
 | File | Purpose |
@@ -109,6 +110,7 @@ loaded.
 | `shapes.json` | Complete benchmark shape set; every optimization round should test all shapes. |
 | `roofline.json` | Per-shape theoretical work, SOL time, and utilization targets. |
 | `metadata.json` | Production-performance metadata used for priority weighting when available. |
+| `kernel_v0.py` | Optional existing kernel passed with `--initial-kernel`; copied into the workspace as `kernel.py`. |
 
 `reference.py` is required by the orchestrator. Include the remaining files for complete
 correctness, benchmark, Roofline, and scheduling behavior.
@@ -127,6 +129,7 @@ With Codex:
 ```bash
 python "$AKA_KERNEL_OPT_HOME/.codex/skills/gpu-kernel-optimizer/orchestrator/optimize.py" \
   --op-dir /path/to/ops/mla_decode \
+  --initial-kernel /path/to/ops/mla_decode/kernel_v0.py \
   --platform H20 \
   --framework CuteDSL \
   --agent codex \
@@ -134,6 +137,9 @@ python "$AKA_KERNEL_OPT_HOME/.codex/skills/gpu-kernel-optimizer/orchestrator/opt
   --token-budget 8000000 \
   --target-util 90
 ```
+
+Omit `--initial-kernel` to keep the existing behavior and use `reference.py` as the
+initial kernel source. The option is currently supported by the single-operator flow.
 
 With Claude:
 

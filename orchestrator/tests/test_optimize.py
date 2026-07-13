@@ -99,6 +99,66 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn("link_skill_gpu_wiki", install_script)
 
 
+class OperatorResolutionTests(unittest.TestCase):
+    def test_uses_reference_as_initial_kernel_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            op_dir = Path(directory)
+            reference = op_dir / "reference.py"
+            reference.write_text("class Model: pass\n")
+
+            op = optimize._resolve_op(str(op_dir))
+
+            self.assertEqual(op["kernel_demo"], str(reference.resolve()))
+
+    def test_uses_explicit_initial_kernel_when_provided(self):
+        with tempfile.TemporaryDirectory() as directory:
+            op_dir = Path(directory) / "op"
+            op_dir.mkdir()
+            (op_dir / "reference.py").write_text("class Model: pass\n")
+            initial_kernel = Path(directory) / "kernel_v0.py"
+            initial_kernel.write_text("class Model: pass\n")
+
+            op = optimize._resolve_op(str(op_dir), str(initial_kernel))
+
+            self.assertEqual(op["kernel_demo"], str(initial_kernel.resolve()))
+
+    def test_rejects_missing_explicit_initial_kernel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            op_dir = Path(directory)
+            (op_dir / "reference.py").write_text("class Model: pass\n")
+
+            with self.assertRaisesRegex(SystemExit, "--initial-kernel not found"):
+                optimize._resolve_op(str(op_dir), str(op_dir / "missing.py"))
+
+    def test_main_passes_explicit_initial_kernel_to_campaign(self):
+        with tempfile.TemporaryDirectory() as directory:
+            op_dir = Path(directory) / "op"
+            op_dir.mkdir()
+            (op_dir / "reference.py").write_text("class Model: pass\n")
+            initial_kernel = Path(directory) / "kernel_v0.py"
+            initial_kernel.write_text("class Model: pass\n")
+
+            with patch.object(optimize, "detect_arch", return_value="sm_90"), \
+                    patch.object(optimize, "Campaign") as campaign:
+                result = optimize.main([
+                    "--op-dir", str(op_dir),
+                    "--initial-kernel", str(initial_kernel),
+                    "--platform", "H20",
+                    "--framework", "CuteDSL",
+                ])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                campaign.call_args.kwargs["kernel_demo"],
+                str(initial_kernel.resolve()),
+            )
+            self.assertEqual(
+                campaign.call_args.kwargs["reference"],
+                str((op_dir / "reference.py").resolve()),
+            )
+            campaign.return_value.run.assert_called_once_with()
+
+
 class WorkspaceInitializationTests(unittest.TestCase):
     def test_creates_codex_rules_symlink(self):
         init_script = Path(__file__).parents[2] / "reference" / "workspace_init.sh"

@@ -38,4 +38,5 @@ separate clean sessions. Exit once `memory/v0.json` exists and the baseline is c
 - platform: `{{PLATFORM}}`
 - framework: `{{FRAMEWORK}}`
 - kernel_demo: `{{KERNEL_DEMO}}` (already copied to `kernel.py`)
+- reference: `{{REFERENCE}}`; operator inputs and shape metadata are under `{{OP_DIR}}`
 - additional_notes: `{{NOTES}}`

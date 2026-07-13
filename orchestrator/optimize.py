@@ -332,6 +332,8 @@ class Campaign:
     kernel_demo: str
     platform: str
     framework: str
+    reference: str = ""            # authoritative reference.py, distinct from an optional V0 kernel
+    op_dir: str = ""               # source of input.py / shapes.json / roofline.json / metadata.json
     notes: str = "none"
     arch: str = ""                 # real runtime GPU arch e.g. "sm_103" / "gfx942"; auto-detected
     gpu_wiki: str = ""             # abs path to gpu-wiki (default: <repo>/gpu-wiki)
@@ -367,6 +369,7 @@ class Campaign:
             PROMPTS_DIR / "setup.md",
             WORKSPACE=str(self.workspace), PLATFORM=self.platform,
             FRAMEWORK=self.framework, KERNEL_DEMO=self.kernel_demo,
+            REFERENCE=self.reference, OP_DIR=self.op_dir,
             NOTES=self.notes, GPU_WIKI=self.gpu_wiki,
             HARDWARE=hardware_directive(self.platform, self.arch),
         )
@@ -819,9 +822,10 @@ class LayerCampaign:
         return reason or "done"
 
 
-def _resolve_op(op_dir: str) -> dict:
+def _resolve_op(op_dir: str, initial_kernel: str = "") -> dict:
     """Derive everything op-specific from the atrex-bench native op dir, so the CLI needs only
-    --op-dir (+ the non-deducible --platform / --framework). Returns name / reference / roofline_py.
+    --op-dir (+ the non-deducible --platform / --framework). The reference is also the default
+    initial kernel source, unless --initial-kernel explicitly provides a V0 implementation.
     """
     d = Path(op_dir).resolve()
     if not d.is_dir():
@@ -829,13 +833,17 @@ def _resolve_op(op_dir: str) -> dict:
     ref = d / "reference.py"
     if not ref.is_file():
         raise SystemExit(f"--op-dir has no reference.py: {d}")
+    kernel_demo = Path(initial_kernel).expanduser().resolve() if initial_kernel else ref
+    if not kernel_demo.is_file():
+        raise SystemExit(f"--initial-kernel not found: {kernel_demo}")
     roofline_py = ""  # atrex-bench root is an ancestor of the op dir; find scripts/roofline.py
     for p in (d, *d.parents):
         cand = p / "scripts" / "roofline.py"
         if cand.is_file():
             roofline_py = str(cand)
             break
-    return {"name": d.name, "reference": str(ref), "roofline_py": roofline_py, "op_dir": str(d)}
+    return {"name": d.name, "reference": str(ref), "kernel_demo": str(kernel_demo),
+            "roofline_py": roofline_py, "op_dir": str(d)}
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -845,6 +853,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                          "input.py / reference.py). EVERYTHING op-specific is read from here — the workspace "
                          "name (dir basename), the kernel/layer to optimize (reference.py), the full shape set, "
                          "per-shape SOL, and the priority anchor (metadata.production_performance). Never hardcoded.")
+    ap.add_argument("--initial-kernel", default="",
+                    help="Optional existing V0 kernel file. Defaults to <op-dir>/reference.py. "
+                         "Supported by the single-op flow.")
     ap.add_argument("--platform", required=True, help="Target hardware, e.g. B200 / H20 / MI308X "
                                                       "(cannot be deduced from the op dir).")
     ap.add_argument("--framework", required=True, help="Target DSL, e.g. CuteDSL / FlyDSL "
@@ -874,8 +885,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                          "via torch (get_device_capability / gcnArchName) — use this if auto-detect fails.")
     args = ap.parse_args(argv)
 
+    if args.layer and args.initial_kernel:
+        ap.error("--initial-kernel is only supported by the single-op flow (without --layer)")
+
     arch = args.arch or detect_arch()
-    op = _resolve_op(args.op_dir)
+    op = _resolve_op(args.op_dir, args.initial_kernel)
     print(f"[orchestrator] op={op['name']} platform={args.platform} agent={args.agent} runtime_arch="
           f"{arch or 'UNKNOWN (detect failed)'} "
           f"(device name / vendor-smi may be desensitized; trusting the runtime API)", flush=True)
@@ -893,8 +907,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     campaign = Campaign(
-        name=op["name"], kernel_demo=op["reference"], platform=args.platform,
-        framework=args.framework, notes=args.notes, arch=arch, gpu_wiki=args.gpu_wiki,
+        name=op["name"], kernel_demo=op["kernel_demo"], platform=args.platform,
+        framework=args.framework, reference=op["reference"], op_dir=op["op_dir"],
+        notes=args.notes, arch=arch, gpu_wiki=args.gpu_wiki,
         agent=args.agent,
         max_iters=args.max_iters, token_budget=args.token_budget, target_util=args.target_util,
         iter_timeout=args.iter_timeout, setup_timeout=args.setup_timeout, max_stall=args.max_stall,
