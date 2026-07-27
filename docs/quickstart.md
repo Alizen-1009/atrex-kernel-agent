@@ -7,13 +7,14 @@ AKA ships two independent ways to run the same profile-driven workflow. Use the 
 - `bash`
 - `git`
 - A compatible coding runtime installed
+- `agate` (`atrex-gateway-client`) configured with gateway URL and credentials
 - NVIDIA profiling: `ncu`, wrapped by `tools/profile_nvidia.sh`
 - AMD profiling: `rocprofv3`, wrapped by `tools/profile_kernel.sh`
 
 Route-specific prerequisites:
 
 - Route 1 requires `jq` for `install.sh`.
-- Route 2 requires Python 3, `torch`, and the `claude` CLI available on `PATH`.
+- Route 2 requires Python 3, `torch`, and either `claude` or `qodercli` available on `PATH`.
 
 ## 1. Clone the Repository
 
@@ -46,11 +47,49 @@ Run a single-operator campaign directly against a SOL-ExecBench op directory con
 ```bash
 python orchestrator/optimize.py \
     --op-dir /path/to/sol-execbench/op \
-    --platform H20 --framework CuteDSL \
+    --platform TARGET_GPU --sandbox-hardware REMOTE_GPU --framework CuteDSL \
+    --agent-cli qodercli \
     --max-iters 20 --token-budget 8000000 --target-util 90
 ```
 
-The orchestrator initializes its required submodules on first run, creates `kernel_opt_<name>/` under `--workspace` or the current directory, spawns fresh clean sessions per iteration, and finalizes a directly submittable SOL-ExecBench output after a passing run.
+The orchestrator initializes its required submodules on first run, creates `kernel_opt_<name>/` under
+`--workspace` or the current directory, and spawns fresh clean sessions per iteration. GPU tests and profiles
+run through `tools/sandbox.py` on `--sandbox-hardware`; `memory/` and Git stay local. It finalizes a directly
+submittable SOL-ExecBench output after a passing run. Omit `--agent-cli` to use Claude, or pass
+`--agent-cli qodercli` after authenticating with `qodercli status`.
+
+To use the same gateway interface on a local GPU, start the bundled community scheduler. It has no
+third-party Python dependencies:
+
+```bash
+python tools/local_gateway.py serve \
+  --host 127.0.0.1 --port 8000 \
+  --state-dir .atrex-local-gateway
+```
+
+The default single worker executes jobs FIFO, so concurrent optimizer requests queue instead of contending
+for the GPU. `agate dev`, `agate get/jobs/cancel`, long polling, environment discovery, and
+`tools/sandbox.py` use the same HTTP shapes as atrex-gateway. See [local_gateway.md](local_gateway.md) for
+the exact compatibility surface.
+
+This is interface compatibility, not process isolation: submitted code runs directly as the server user.
+Bind it to localhost and submit trusted code only. The worker inherits the server process's Python/toolchain
+environment, so install `torch`, Triton, and any kernel DSL needed by the workload into that environment.
+
+Then select the localhost endpoint and the server's `local` GPU alias:
+
+```bash
+python orchestrator/optimize.py \
+    --op-dir /path/to/sol-execbench/op \
+    --platform LOCAL_GPU --framework Triton \
+    --sandbox-hardware local \
+    --sandbox-url http://127.0.0.1:8000 \
+    --max-iters 20
+```
+
+`--sandbox-url` and `--sandbox-profile` are mutually exclusive. The localhost mode changes only where
+agate executes jobs; tests and profiles still go through `tools/sandbox.py`, while `memory/`, plans, edits,
+and Git remain workspace-local.
 
 ## 3. Inspect Outputs
 
