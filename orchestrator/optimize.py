@@ -81,20 +81,24 @@ from pathlib import Path
 from typing import Callable, Optional
 
 try:
+    from .aggregate_dispatch import embed_bucket_sources
     from .optimization_policy import (
         OPTIMIZATION_MODE_CHOICES,
         install_workspace_policy,
         optimization_mode_directive,
         production_kernel_violations,
         reject_production_commit,
+        source_uses_gluon,
     )
 except ImportError:  # direct script execution: python orchestrator/optimize.py
+    from aggregate_dispatch import embed_bucket_sources  # type: ignore[no-redef]
     from optimization_policy import (  # type: ignore[no-redef]
         OPTIMIZATION_MODE_CHOICES,
         install_workspace_policy,
         optimization_mode_directive,
         production_kernel_violations,
         reject_production_commit,
+        source_uses_gluon,
     )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -106,11 +110,20 @@ SANDBOX_TOOL = REPO_ROOT / "tools" / "sandbox.py"
 SESSION_SHELL_GUARD = REPO_ROOT / "tools" / "session_shell_guard.sh"
 HUMANIZE_DIR = REPO_ROOT / "3rdparty" / "humanize"
 CONVERT_PERF_TOL = 0.05   # triton->gluon is a direct translation: gluon must be within +5% of triton
-CONVERT_MIN_TOKENS = 200_000  # a convert session below this (and no gluon) barely ran -> "bailed"
-                              # (set below a genuine-but-incomplete attempt, e.g. ~336K; the launch-and-
-                              # exit bail we saw was ~85K — only that class should trip the give-up)
-CONVERT_MAX_BAILS = 2         # consecutive bails -> disable escalation, continue triton-only
+CONVERT_MIN_TOKENS = 200_000  # below this, flag a shallow attempt in the retry diagnostics
+DEFAULT_CONVERT_AFTER = 3     # mandatory Triton->Gluon escalation after three consecutive stalls
 MEMORY_MASK_INTERVAL = 100    # periodically drop half of active optimization history
+SALVAGE_TIMEOUT_S = 1200      # post-mortem session budget for an iteration killed mid-flight
+INTERRUPTED_CATEGORY = "interrupted_session"
+FRAMEWORK_BASELINE_FILE = "framework_baseline.json"
+FRAMEWORK_BASELINE_VERSION = 1     # the framework baseline always occupies v1, retries overwrite it
+FRAMEWORK_BASELINE_TIMEOUT_S = 10800
+FRAMEWORK_BASELINE_MODES = ("auto", "always", "never")
+FRAMEWORK_BASELINE_CATEGORY = "framework_baseline"
+IMMUTABLE_BASELINE_PATHS = (
+    "test_kernel.py", "reference.py", "input.py", "shapes.json", "metadata.json",
+    "roofline.json", "workload.jsonl", "definition.json", "valid.py", "memory/v0.json",
+)
 TEST_RESULT_PREFIX = "[test_kernel] RESULT_JSON="
 AGENT_CLI_CHOICES = ("claude", "qodercli", "codex")
 NVIDIA_FRAMEWORKS = ("Triton", "CuteDSL", "Cuda")
@@ -119,8 +132,11 @@ DEFAULT_FRAMEWORKS = ("Triton",)
 WORKLOAD_BUCKETS_FILE = "workload_buckets.json"
 AGGREGATION_STATE_FILE = "aggregation_state.json"
 DISPATCH_SIGNATURES_FILE = "dispatch_signatures.json"
+DISPATCH_VISIBILITY_POLICY = "host_no_sync_structural_v1"
 AGGREGATE_DISPATCH_FILE = "aggregate_dispatch.json"
 AGGREGATE_KERNELS_DIR = "aggregate_kernels"
+AGGREGATE_DISPATCH_SCHEMA_VERSION = 2
+AGGREGATE_SOURCE_LAYOUT = "embedded_single_file"
 DISPATCH_SIGNATURE_RESULT_PREFIX = "[dispatch-signatures] RESULT_JSON="
 BUCKETS_DIR = "workload_buckets"
 AGGREGATE_VALIDATION_TIMEOUT = 600   # public dev gateway execution limit
@@ -452,9 +468,11 @@ def _is_triton_family(framework: str) -> bool:
 
 
 def kernel_is_gluon(workspace: Path) -> bool:
-    """True once kernel.py has been converted to Gluon (import present)."""
+    """True once the working-tree kernel.py has a real Gluon import."""
     k = workspace / "kernel.py"
-    return k.exists() and "gluon" in k.read_text(encoding="utf-8", errors="ignore")
+    return k.exists() and source_uses_gluon(
+        k.read_text(encoding="utf-8", errors="ignore")
+    )
 
 
 def head_kernel_is_gluon(workspace: Path) -> bool:
@@ -466,7 +484,28 @@ def head_kernel_is_gluon(workspace: Path) -> bool:
                              capture_output=True, text=True)
     except OSError:
         return False
-    return out.returncode == 0 and "gluon" in out.stdout
+    return out.returncode == 0 and source_uses_gluon(out.stdout)
+
+
+def should_convert_to_gluon(
+    framework: str,
+    stall: int,
+    convert_after: int,
+    *,
+    head_is_gluon: bool,
+) -> bool:
+    """Whether the campaign is latched into mandatory Triton->Gluon conversion.
+
+    Once the threshold is reached this remains true after a failed conversion because
+    the stall counter is deliberately not reset.  Only a committed Gluon HEAD releases
+    the latch and returns the campaign to ordinary optimization.
+    """
+    return (
+        convert_after > 0
+        and _is_triton_family(framework)
+        and not head_is_gluon
+        and stall >= convert_after
+    )
 
 
 # ── thin IO ─────────────────────────────────────────────────────────────────
@@ -479,6 +518,7 @@ class SessionResult:
     tokens: int
     stdout_tail: str
     stderr_tail: str
+    session_id: str = ""
 
 
 def _render(template_path: Path, **kw: str) -> str:
@@ -990,15 +1030,22 @@ def _codex_settings_args(raw: str) -> list[str]:
     return args
 
 
-def _session_command(agent_cli: str, prompt: str, session_id: str) -> list[str]:
+def _session_command(
+    agent_cli: str,
+    prompt: str,
+    session_id: str,
+    reasoning_effort: str = "max",
+) -> list[str]:
     """Return a non-interactive, fresh-session command for the selected coding CLI."""
+    if reasoning_effort not in {"low", "medium", "high", "max"}:
+        raise ValueError(f"unsupported reasoning effort: {reasoning_effort!r}")
     if agent_cli == "claude":
         cmd = [
             "claude", "--print", "--verbose",
             "--dangerously-skip-permissions",
             "--output-format", "stream-json",
             "--session-id", session_id,
-            "--effort", "max",
+            "--effort", reasoning_effort,
         ]
         provider_settings = "ATREX_CLAUDE_SESSION_SETTINGS"
     elif agent_cli == "qodercli":
@@ -1008,7 +1055,7 @@ def _session_command(agent_cli: str, prompt: str, session_id: str) -> list[str]:
             "--output-format", "stream-json",
             "--session-id", session_id,
             "--no-session-persistence",
-            "--reasoning-effort", "max",
+            "--reasoning-effort", reasoning_effort,
         ]
         provider_settings = "ATREX_QODER_SESSION_SETTINGS"
     elif agent_cli == "codex":
@@ -1020,7 +1067,7 @@ def _session_command(agent_cli: str, prompt: str, session_id: str) -> list[str]:
         cmd = [
             "codex", "exec", "--json", "--ephemeral", "--color", "never",
             "--dangerously-bypass-approvals-and-sandbox",
-            "-c", 'model_reasoning_effort="max"',
+            "-c", f'model_reasoning_effort="{reasoning_effort}"',
         ]
         provider_settings = "ATREX_CODEX_SESSION_SETTINGS"
     else:
@@ -1034,12 +1081,11 @@ def _session_command(agent_cli: str, prompt: str, session_id: str) -> list[str]:
         cmd += _codex_settings_args(session_settings or "")
     elif session_settings:
         cmd += ["--settings", session_settings]
-    # Claude and Qoder accept Claude-compatible local plugins. Codex discovers the hydrated
-    # Humanize skill from the workspace-local .agents/skills tree created by link_runtime().
-    # ensure_submodules() provisions jq before sessions start, so Humanize loads consistently
-    # for Claude and Qoder. Codex uses its hydrated repository-local skill instead.
+    # Claude uses the upstream Humanize plugin. Qoder generates plans directly and must not load
+    # Humanize: its headless Skill tool cannot invoke the plugin's model-disabled gen-plan flow.
+    # Codex discovers the hydrated Humanize skill from the workspace-local .agents/skills tree.
     if (
-        agent_cli != "codex"
+        agent_cli == "claude"
         and (HUMANIZE_DIR / "skills" / "humanize-gen-plan" / "SKILL.md").exists()
     ):
         cmd += ["--plugin-dir", str(HUMANIZE_DIR)]
@@ -1173,10 +1219,11 @@ def run_session(
     sandbox_profile: str = "",
     sandbox_url: str = "",
     sandbox_timeout: int = DEFAULT_SANDBOX_TIMEOUT,
+    reasoning_effort: str = "max",
 ) -> SessionResult:
     """Run one clean coding-agent session with no conversational memory from prior iterations."""
     session_id = str(uuid.uuid4())
-    cmd = _session_command(agent_cli, prompt, session_id)
+    cmd = _session_command(agent_cli, prompt, session_id, reasoning_effort)
     env = _session_env(agent_cli)
     env["IS_SANDBOX"] = "1"
     if sandbox_hardware:
@@ -1195,6 +1242,7 @@ def run_session(
         tokens=_tokens_from_stream(stdout),
         stdout_tail=stdout[-2000:],
         stderr_tail=stderr[-2000:],
+        session_id=session_id,
     )
 
 
@@ -1211,11 +1259,12 @@ def sandbox_directive(hardware: str, profile: str = "", url: str = "") -> str:
         f"- Target gateway hardware: **{hardware}**{endpoint}. All GPU execution must cross this "
         "gateway boundary, including when the endpoint is localhost; source edits, optimizer state, and "
         "Git operations remain in the workspace.\n"
-        "- Run every correctness or performance test through the gateway sandbox. Always pass `--no-memory`; "
+        "- Run every correctness or performance test through the gateway sandbox's `run` interface. "
+        "Always pass `--kind run --no-memory`; "
         "read the emitted `[test_kernel] RESULT_JSON=...` line, then update `memory/v<N>.json` locally.\n"
         "  ```bash\n"
-        "  python tools/sandbox.py --no-sync -- python test_kernel.py --version v<N> --no-memory\n"
-        "  python tools/sandbox.py --no-sync -- python test_kernel.py --version v<N> --multi-seed 5 --no-memory\n"
+        "  python tools/sandbox.py --kind run --no-sync -- python test_kernel.py --version v<N> --no-memory\n"
+        "  python tools/sandbox.py --kind run --no-sync -- python test_kernel.py --version v<N> --multi-seed 5 --no-memory\n"
         "  ```\n"
         "  The harness must benchmark only the base seed. Additional `--multi-seed` runs are "
         "correctness-only (no warmup/timing/reference benchmark repetition), so the full robustness "
@@ -1223,12 +1272,21 @@ def sandbox_directive(hardware: str, profile: str = "", url: str = "") -> str:
         "coverage. Follow the declared evaluator route: an orchestrator-installed Atrex-Bench adapter "
         "must never be edited; only a derived legacy boundary may create its harness before V0. After "
         "V0 every route's harness remains immutable.\n"
-        "- Run NVIDIA/AMD profiling in the sandbox as one self-contained command; `profiles/` analysis "
-        "artifacts are synchronized back automatically:\n"
+        "- Sandbox uploads are allowlist-only. `test_kernel.py`, dispatch-signature collection, standard "
+        "profile wrappers, and direct `import kernel` checks select their required inputs automatically. "
+        "For any nonstandard command or dynamically opened local file, declare each dependency before `--` "
+        "with repeatable `--input <relative-file-or-directory>`. Never use a generic `python -c print(...)` "
+        "job to infer evaluator health; it does not exercise the evaluator payload or code path.\n"
+        "- Run NVIDIA/AMD profiling through the typed `profile` interface. The structured response is "
+        "saved as `profiles/v<N>/gateway_profile.json`; the wrapper command after `--` is used only as "
+        "a dev fallback when the endpoint cannot represent the workload:\n"
         "  ```bash\n"
-        "  python tools/sandbox.py --sync profiles/v<N> -- bash tools/profile_nvidia.sh profiles/v<N>/harness/profile_driver.py --output-dir profiles/v<N> --source\n"
-        "  python tools/sandbox.py --sync profiles/v<N> -- bash tools/profile_kernel.sh profiles/v<N>/harness/profile_driver.py --output-dir profiles/v<N>\n"
+        "  python tools/sandbox.py --kind profile --profile-level sol --sync profiles/v<N> -- bash tools/profile_nvidia.sh profiles/v<N>/harness/profile_driver.py --output-dir profiles/v<N>\n"
+        "  python tools/sandbox.py --kind profile --profile-level sol --sync profiles/v<N> -- bash tools/profile_kernel.sh profiles/v<N>/harness/profile_driver.py --output-dir profiles/v<N>\n"
         "  ```\n"
+        "  Use `--profile-level deep --kernel-regex '^<exact kernel name>$'` for a focused typed profile. "
+        "If source-line correlation or another typed-profile gap is specifically required, the sandbox may "
+        "use the supplied wrapper through `dev`; do not choose dev merely for convenience.\n"
         "- Never run `test_kernel.py`, GPU timers, `ncu`, `rocprofv3`, or the profile wrappers outside "
         "the gateway interface. Never upload or create optimizer `memory/` as worker state; memory updates, "
         "plans, edits, and git operations stay local.\n"
@@ -1263,10 +1321,12 @@ def _sandbox_command(
     sync: tuple[str, ...] = (),
     wall_timeout: Optional[int] = None,
     dispatch_signatures: bool = False,
+    gateway_kind: str = "auto",
 ) -> subprocess.CompletedProcess[str]:
     """Run one command through tools/sandbox.py and capture its user-visible output."""
     cmd = [
         sys.executable, str(SANDBOX_TOOL),
+        "--kind", gateway_kind,
         "--hardware", hardware,
         "--workspace", str(workspace),
         "--timeout", str(timeout),
@@ -1369,6 +1429,110 @@ def read_memory(workspace: Path, n: int) -> Optional[dict]:
         return None
 
 
+def memory_record_is_empty(memory: Optional[dict]) -> bool:
+    """Whether a record carries no findings at all.
+
+    `memory_manager create` writes an all-null template, so a session killed mid-round usually
+    leaves a file with no verdict, no measurement, and no lessons. Treating that as a real record
+    would silently skip recovery and hand the next session a blank round.
+    """
+    if not memory:
+        return True
+    gate = (memory.get("quality_gate") or {}).get("result")
+    status = (memory.get("correctness") or {}).get("status")
+    latency = (memory.get("performance") or {}).get("latency_us")
+    category = (memory.get("optimization") or {}).get("action_category")
+    lessons = memory.get("pitfalls_and_fixes") or memory.get("search_log") or memory.get("open_directions")
+    return not (gate or status or isinstance(latency, (int, float)) or category or lessons)
+
+
+def session_transcript_path(agent_cli: str, session_id: str) -> Optional[Path]:
+    """Locate a finished session's transcript so a post-mortem session can read what it tried.
+
+    Resolved by globbing for the session id rather than reconstructing the CLI's project-slug
+    encoding, which is an internal convention. Codex sessions are ephemeral and leave none.
+    """
+    if not session_id:
+        return None
+    roots = {"claude": ".claude", "qodercli": ".qoder"}
+    root = roots.get(agent_cli)
+    if root is None:
+        return None
+    for candidate in sorted((Path.home() / root / "projects").glob(f"*/{session_id}.jsonl")):
+        return candidate
+    return None
+
+
+def record_interrupted_iteration(
+    workspace: Path,
+    n: int,
+    *,
+    kind: str,
+    exit_status: int,
+    timed_out: bool,
+    timeout_s: int,
+    stderr_tail: str = "",
+) -> Path:
+    """Mechanical fallback record for an iteration killed before it wrote its own memory.
+
+    Every version must leave a record: `latest_version` and the next session's history read are
+    both driven by `memory/v*.json`, so a hole makes the following sessions re-derive state from
+    scratch and re-run already-refuted experiments. Merges into a partial record instead of
+    overwriting it, and stays uncommitted so it survives the safety-net `git reset --hard`.
+    """
+    memory_path = workspace / "memory" / f"v{n}.json"
+    try:
+        memory = json.loads(memory_path.read_text(encoding="utf-8")) if memory_path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        memory = {}
+    if not isinstance(memory, dict):
+        memory = {}
+
+    if timed_out:
+        cause = f"{kind} session killed by the {timeout_s}s hang backstop"
+        status = "TIMEOUT_FAIL"
+    else:
+        cause = f"{kind} session crashed with exit={exit_status}"
+        status = "FAIL"
+    tail = stderr_tail.strip()[:500]
+    failure_reason = f"{cause}; no result was recorded by the session" + (f". stderr: {tail}" if tail else "")
+
+    memory["version"] = f"v{n}"
+    memory["masked"] = False
+    memory.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+    memory["git_commit_hash"] = None
+    memory["quality_gate"] = {"result": "FAIL", "failure_reason": failure_reason}
+    correctness = memory.setdefault("correctness", {})
+    if isinstance(correctness, dict):
+        correctness["status"] = status
+    else:
+        memory["correctness"] = {"status": status}
+    optimization = memory.setdefault("optimization", {})
+    if not isinstance(optimization, dict):
+        optimization = {}
+        memory["optimization"] = optimization
+    optimization["action_category"] = INTERRUPTED_CATEGORY
+    optimization["action_description"] = (
+        f"{cause}; whatever it was attempting is unvalidated and its conclusions are untrustworthy"
+    )
+    pitfalls = memory.setdefault("pitfalls_and_fixes", [])
+    if not isinstance(pitfalls, list):
+        pitfalls = []
+        memory["pitfalls_and_fixes"] = pitfalls
+    pitfalls.append({
+        "error_type": "infra",
+        "error_message": failure_reason,
+        "lesson": (
+            "This round was cut off by infrastructure, not by evidence. Do not treat its direction "
+            "as a refuted dead-end, and do not assume any measurement from it is valid."
+        ),
+    })
+
+    memory_path.parent.mkdir(parents=True, exist_ok=True)
+    memory_path.write_text(json.dumps(memory, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return memory_path
+
+
 def mask_half_memory(workspace: Path, iteration: int) -> list[str]:
     """Randomly mask half of active optimization memory every 100 iterations.
 
@@ -1449,11 +1613,32 @@ def git_head(workspace: Path) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def git_kernel_blob(workspace: Path) -> str:
-    """Committed kernel.py blob id, stable across metadata-only commits."""
+def git_path_blob(workspace: Path, ref: str, path: str) -> str:
+    """Committed blob id of one path at one ref, or '' when it is absent there."""
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD:kernel.py"],
+            ["git", "rev-parse", f"{ref}:{path}"],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def git_kernel_blob(workspace: Path) -> str:
+    """Committed kernel.py blob id, stable across metadata-only commits."""
+    return git_path_blob(workspace, "HEAD", "kernel.py")
+
+
+def git_worktree_blob(workspace: Path, path: str) -> str:
+    """Blob id of the on-disk file, or '' when it is missing."""
+    if not (workspace / path).is_file():
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "hash-object", "--", path],
             cwd=str(workspace),
             capture_output=True,
             text=True,
@@ -1471,6 +1656,10 @@ def head_kernel_is_initial_baseline(workspace: Path) -> bool:
     metadata without changing ``kernel.py``.  Resume must recognize that state
     by kernel provenance, not by assuming ``latest_version > 0`` means an
     optimized kernel was accepted.
+
+    Once the framework-baseline stage lands v1 this returns False, because the
+    accepted framework kernel is a real kernel change.  The framework baseline
+    is tracked by ``framework_baseline.json``, not by this predicate.
     """
     roots = subprocess.run(
         ["git", "rev-list", "--max-parents=0", "HEAD"],
@@ -1493,6 +1682,82 @@ def head_kernel_is_initial_baseline(workspace: Path) -> bool:
         baseline_blob.stdout.strip()
         and baseline_blob.stdout.strip() == git_kernel_blob(workspace)
     )
+
+
+def read_framework_baseline(workspace: Path) -> Optional[dict]:
+    """Read the framework-baseline marker from committed HEAD, never from the worktree.
+
+    An interrupted session can leave an unstaged marker behind; trusting it would pin bucket
+    baselines to a kernel that was never validated.
+    """
+    show = subprocess.run(
+        ["git", "show", f"HEAD:{FRAMEWORK_BASELINE_FILE}"],
+        cwd=str(workspace),
+        capture_output=True,
+        text=True,
+    )
+    if show.returncode != 0:
+        return None
+    try:
+        marker = json.loads(show.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{workspace / FRAMEWORK_BASELINE_FILE} is not valid JSON: {exc}") from exc
+    if not isinstance(marker, dict):
+        raise RuntimeError(f"{workspace / FRAMEWORK_BASELINE_FILE} must contain a JSON object")
+    return marker
+
+
+def resolve_framework_baseline_commit(workspace: Path) -> tuple[str, int]:
+    """Return the pinned (commit, version) of the framework baseline, or ("", 0) when unpinned.
+
+    Verification is fail-closed and never consults HEAD's tree, so the pin survives HEAD
+    advancing to an aggregated dispatcher kernel. A broken marker is an error rather than a
+    silent fallback to the root commit: falling back would mix PyTorch and framework
+    provenance across buckets, which is exactly what pinning exists to prevent.
+    """
+    marker = read_framework_baseline(workspace)
+    if marker is None:
+        return "", 0
+    commit = _normalize_commit_hash(marker.get("commit"))
+    if not commit:
+        raise RuntimeError(f"{FRAMEWORK_BASELINE_FILE} has no usable commit hash")
+    exists = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{commit}^{{commit}}"],
+        cwd=str(workspace), capture_output=True, text=True,
+    )
+    if exists.returncode != 0:
+        raise RuntimeError(f"{FRAMEWORK_BASELINE_FILE} points at missing commit {commit[:12]}")
+    ancestry = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+        cwd=str(workspace), capture_output=True, text=True,
+    )
+    if ancestry.returncode != 0:
+        raise RuntimeError(
+            f"{FRAMEWORK_BASELINE_FILE} commit {commit[:12]} is not an ancestor of HEAD"
+        )
+    blob = subprocess.run(
+        ["git", "rev-parse", f"{commit}:kernel.py"],
+        cwd=str(workspace), capture_output=True, text=True,
+    )
+    recorded_blob = str(marker.get("kernel_blob") or "").strip()
+    if blob.returncode != 0 or not recorded_blob or blob.stdout.strip() != recorded_blob:
+        raise RuntimeError(
+            f"{FRAMEWORK_BASELINE_FILE} kernel blob does not match commit {commit[:12]}"
+        )
+    version_text = str(marker.get("version") or "")
+    match = re.fullmatch(r"v(\d+)", version_text)
+    if match is None:
+        raise RuntimeError(f"{FRAMEWORK_BASELINE_FILE} has an unusable version {version_text!r}")
+    return commit, int(match.group(1))
+
+
+def head_kernel_is_framework_baseline(workspace: Path) -> bool:
+    """Whether the committed HEAD kernel is still exactly the pinned framework baseline."""
+    marker = read_framework_baseline(workspace)
+    if marker is None:
+        return False
+    recorded_blob = str(marker.get("kernel_blob") or "").strip()
+    return bool(recorded_blob and recorded_blob == git_kernel_blob(workspace))
 
 
 def preserve_interrupted_tracked_changes(workspace: Path, context: str) -> str:
@@ -1707,10 +1972,18 @@ def peak_util(mem: Optional[dict]) -> float:
     return max([float(v) for v in vals if isinstance(v, (int, float))] or [0.0])
 
 
-def best_validated_latency_us(workspace: Path) -> Optional[float]:
-    """Best correctness-passing measured latency in a workspace."""
+def best_validated_latency_us(workspace: Path, *, from_version: Optional[int] = None) -> Optional[float]:
+    """Best correctness-passing measured latency in a workspace.
+
+    Versions before a pinned framework baseline are excluded by default: production cannot ship
+    the PyTorch V0 wrapper, so treating its (typically much faster, library-backed) latency as the
+    incumbent would reject every candidate a from-scratch DSL kernel can produce.
+    """
+    if from_version is None:
+        _pinned_commit, pinned_version = resolve_framework_baseline_commit(workspace)
+        from_version = pinned_version
     best: Optional[float] = None
-    for version in range(0, latest_version(workspace) + 1):
+    for version in range(from_version, latest_version(workspace) + 1):
         memory = read_memory(workspace, version)
         if not memory:
             continue
@@ -1889,6 +2162,13 @@ def _baseline_driver_directive(agent_cli: str) -> str:
             "session. If Codex collaboration/sub-agent tools are available, delegate that bounded "
             "implementation task and wait for it; otherwise execute the skill directly yourself"
         )
+    if agent_cli == "qodercli":
+        return (
+            "Complete the baseline workflow directly in this Qoder session. Do not launch an "
+            "Agent/subagent: nested workload-bucket repositories can otherwise be resolved as the "
+            "aggregate parent workspace. Treat the current working directory as the only writable "
+            "workspace and use relative paths for every campaign file"
+        )
     return (
         "Launch the `gpu-kernel-baseline` subagent (by name). You may spawn it in the "
         "background, but **you MUST wait for it to complete before you exit**"
@@ -1904,6 +2184,14 @@ def _plan_generator_directive(agent_cli: str, version: int) -> str:
             "output. Use direct/no-discussion mode for this single-action optimization plan. "
             "The skill is repository-local under `.agents/skills/`; do not look for a slash "
             "command or Claude plugin."
+        )
+    if agent_cli == "qodercli":
+        return (
+            f"Read `{draft}` and generate `{plan}` yourself in this Qoder session. Do not invoke "
+            "Humanize, a slash command, the Skill tool, or a planning subagent. Write a complete "
+            "one-shot plan containing the evidence-to-action chain, exactly one optimization "
+            "category, concrete file changes, correctness/performance validation steps, and "
+            "measurable acceptance criteria. Preserve the draft's Search Log and constraints."
         )
     return (
         "```text\n"
@@ -1921,9 +2209,9 @@ def link_runtime(workspace: Path, atrex_bench_root: Optional[Path] = None) -> No
     Also installs the same skills and agent definitions into ``.claude/`` and ``.qoder/``, and
     repository-local Codex skills into ``.agents/skills/``.
 
-    Claude/Qoder load Humanize via ``--plugin-dir`` after the orchestrator provisions ``jq``.
-    Codex receives a repository-scoped, hydrated Humanize skill without changing global user
-    state.
+    Claude loads Humanize via ``--plugin-dir`` after the orchestrator provisions ``jq``. Qoder
+    owns plan generation directly and does not load Humanize. Codex receives a repository-scoped,
+    hydrated Humanize skill without changing global user state.
     """
     for sub in ("tools", "reference", "skills", "reference-projects", "gpu-wiki"):
         src, dst = REPO_ROOT / sub, workspace / sub
@@ -2026,8 +2314,9 @@ class Campaign:
     target_util: float = 90.0
     iter_timeout: int = 5400       # 90 min hang-backstop per optimization session
     setup_timeout: int = 7200      # 120 min for the baseline session
+    salvage_timeout: int = SALVAGE_TIMEOUT_S  # 0 = skip the post-mortem agent, record mechanically
     max_stall: int = 0             # 0 = disabled (budget-only); >0 = stop after N no-commit iters
-    convert_after: int = 5         # triton-only: after N stalled iters, run ONE triton->gluon convert session (0=off)
+    convert_after: int = DEFAULT_CONVERT_AFTER  # triton-only: mandatory Gluon conversion threshold
     sandbox_hardware: str = ""     # agate scheduler token, e.g. REMOTE_GPU (may differ from platform)
     sandbox_profile: str = ""      # pre/prod; empty preserves normal agate URL resolution
     sandbox_url: str = ""          # explicit endpoint, e.g. http://127.0.0.1:8000
@@ -2035,6 +2324,8 @@ class Campaign:
     atrex_bench_root: str = ""      # native shapes route: canonical checkout owning run_eval.py
     agent_cli: str = "claude"       # clean-session coding backend: claude, qodercli, or codex
     optimization_mode: str = "leaderboard"  # permissive contest flow or strict production gate
+    framework_baseline: str = "auto"        # auto = production only; always | never override it
+    framework_baseline_timeout: int = FRAMEWORK_BASELINE_TIMEOUT_S
     on_improvement: Optional[Callable[["Campaign", int, dict], None]] = field(
         default=None, repr=False, compare=False
     )
@@ -2059,6 +2350,78 @@ class Campaign:
               f"tokens={res.tokens} cum_tokens={self.tokens_spent}", flush=True)
         if res.exit_status != 0 or res.timed_out:
             print(f"[orchestrator] stderr tail:\n{res.stderr_tail}", file=sys.stderr, flush=True)
+
+    def _salvage_memory(self, n: int, res: SessionResult, kind: str) -> bool:
+        """Run a short record-only session that reconstructs the killed round into memory/v<N>.json."""
+        if self.salvage_timeout <= 0:
+            return False
+        if res.timed_out:
+            kill_reason = f"it hit the {self.iter_timeout}s hang backstop and was killed"
+        else:
+            kill_reason = (
+                f"it exited with status {res.exit_status} "
+                "(typically an API failure such as a provider rate limit, or a policy termination)"
+            )
+        transcript = session_transcript_path(self.agent_cli, res.session_id)
+        prompt = _render(
+            PROMPTS_DIR / "salvage.md",
+            WORKSPACE=str(self.workspace),
+            N=n,
+            PREV=n - 1,
+            KIND=kind,
+            KILL_REASON=kill_reason,
+            TRANSCRIPT=str(transcript) if transcript else "(no transcript was retained for this session)",
+            STDOUT_TAIL=res.stdout_tail or "(empty)",
+            MODE_POLICY=self._mode_directive(),
+        )
+        head_before = git_head(self.workspace)
+        salvage_res = run_session(
+            self.workspace, prompt, timeout=self.salvage_timeout,
+            agent_cli=self.agent_cli,
+            sandbox_hardware=self.sandbox_hardware,
+            sandbox_profile=self.sandbox_profile,
+            sandbox_url=self.sandbox_url,
+            sandbox_timeout=self.sandbox_timeout,
+            reasoning_effort="high",
+        )
+        self._account(salvage_res, f"salvage v{n}")
+        # A post-mortem session must not move HEAD. Undo with --soft: an unwanted commit disappears
+        # while the interrupted round's uncommitted kernel edits stay in the worktree for the next session.
+        if head_before and git_head(self.workspace) != head_before:
+            subprocess.run(
+                ["git", "reset", "--soft", head_before],
+                cwd=str(self.workspace),
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(
+                f"[orchestrator] salvage v{n} committed against policy; HEAD restored to {head_before[:8]}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return not memory_record_is_empty(read_memory(self.workspace, n))
+
+    def _ensure_iteration_memory(self, n: int, res: SessionResult, kind: str) -> None:
+        """Guarantee every round leaves a memory record, even when its session never finished one."""
+        if not memory_record_is_empty(read_memory(self.workspace, n)):
+            return
+        salvaged = self._salvage_memory(n, res, kind)
+        if memory_record_is_empty(read_memory(self.workspace, n)):
+            record_interrupted_iteration(
+                self.workspace, n,
+                kind=kind,
+                exit_status=res.exit_status,
+                timed_out=res.timed_out,
+                timeout_s=self.iter_timeout,
+                stderr_tail=res.stderr_tail,
+            )
+            salvaged = False
+        print(
+            f"[orchestrator] v{n} memory: "
+            f"{'reconstructed by salvage session' if salvaged else 'mechanical interrupted-round record'}",
+            flush=True,
+        )
 
     def _link_runtime(self) -> None:
         native_root = Path(self.atrex_bench_root) if self.atrex_bench_root else None
@@ -2149,6 +2512,7 @@ class Campaign:
             sandbox_profile=self.sandbox_profile,
             sandbox_url=self.sandbox_url,
             sandbox_timeout=self.sandbox_timeout,
+            reasoning_effort="high",
         )
         self._account(res, "setup")
         if res.exit_status != 0 and res.tokens == 0:
@@ -2193,6 +2557,7 @@ class Campaign:
                 sandbox_profile=self.sandbox_profile,
                 sandbox_url=self.sandbox_url,
                 sandbox_timeout=self.sandbox_timeout,
+                reasoning_effort="high",
             )
             self._account(recovery, "setup recovery")
             if recovery.exit_status != 0 and recovery.tokens == 0:
@@ -2230,6 +2595,7 @@ class Campaign:
             self.sandbox_url,
             self.sandbox_timeout,
             ["python", "test_kernel.py", "--version", "v0", "--no-memory"],
+            gateway_kind="run",
         )
         if test.stdout:
             print(test.stdout, end="" if test.stdout.endswith("\n") else "\n", flush=True)
@@ -2254,6 +2620,400 @@ class Campaign:
                        cwd=str(self.workspace), check=True)
         subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=str(self.workspace),
                        check=True, stdout=subprocess.DEVNULL)
+
+    def ensure_framework_baseline(self) -> None:
+        """Land the campaign's first real framework kernel as v1, exactly once.
+
+        V0 is a PyTorch reference wrapper. Without this stage every workload bucket repeats the
+        same framework bring-up from scratch, which is where whole days get lost on toolchain
+        quirks. Buckets derive from the commit pinned here, so the bring-up cost is paid once.
+
+        Idempotent and resume-safe: a pinned baseline is never rewritten, and a campaign that has
+        already progressed past V0 without a pin is left exactly as it is. Not wired into
+        LayerCampaign, which drives its own sessions.
+        """
+        action, reason = self._framework_baseline_decision()
+        if action == "skip":
+            if reason:
+                print(f"[orchestrator] framework baseline skipped: {reason}", flush=True)
+            return
+        print(f"[orchestrator] framework baseline: {action} ({reason})", flush=True)
+        if action == "pin":
+            root_commit = self._single_root_commit()
+            self._pin_framework_baseline(root_commit, version=0)
+            return
+
+        n = FRAMEWORK_BASELINE_VERSION
+        root_commit = self._single_root_commit()
+        v0_blob = git_path_blob(self.workspace, root_commit, "kernel.py")
+        pre_head = git_head(self.workspace)
+
+        if action == "run":
+            self._link_runtime()
+            res = run_session(
+                self.workspace, self._framework_baseline_prompt(n),
+                timeout=self.framework_baseline_timeout,
+                agent_cli=self.agent_cli,
+                sandbox_hardware=self.sandbox_hardware,
+                sandbox_profile=self.sandbox_profile,
+                sandbox_url=self.sandbox_url,
+                sandbox_timeout=self.sandbox_timeout,
+                reasoning_effort="high",
+            )
+            self._account(res, f"framework baseline v{n}")
+            if res.exit_status != 0 and res.tokens == 0:
+                raise RuntimeError(
+                    "framework baseline session produced no output "
+                    f"(likely API key / auth issue — {_agent_auth_hint(self.agent_cli)})"
+                )
+            self._warn_restored_baseline_paths(root_commit)
+            problem = self._framework_baseline_problem(v0_blob, root_commit)
+            if problem:
+                self._recover_framework_baseline(problem, v0_blob, root_commit, pre_head)
+                self._warn_restored_baseline_paths(root_commit)
+                problem = self._framework_baseline_problem(v0_blob, root_commit)
+        else:  # adopt: our own interrupted run already committed the kernel
+            self._warn_restored_baseline_paths(root_commit)
+            problem = self._framework_baseline_problem(v0_blob, root_commit)
+        result: Optional[dict] = None
+        if not problem:
+            result, problem = self._validate_framework_baseline(n)
+        if problem:
+            self._record_framework_baseline_failure(problem)
+            if pre_head:
+                subprocess.run(["git", "reset", "--hard", pre_head], cwd=str(self.workspace),
+                               check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            raise RuntimeError(f"framework baseline v{n} rejected: {problem}")
+
+        commit = self._commit_framework_baseline(n, result or {})
+        latency = ((read_memory(self.workspace, n) or {}).get("performance") or {}).get("latency_us")
+        print(
+            f"[orchestrator] framework baseline v{n} accepted: {self.framework} "
+            f"@ {commit[:8]} ({latency} us geomean)",
+            flush=True,
+        )
+
+    def _framework_baseline_decision(self) -> tuple[str, str]:
+        """Resolve what the stage should do: skip | pin | run | adopt, with the reason."""
+        if self.framework_baseline == "never":
+            return "skip", ""
+        if latest_version(self.workspace) < 0 or not git_head(self.workspace):
+            raise RuntimeError("framework baseline requires a committed V0 baseline first")
+
+        pinned_commit, pinned_version = resolve_framework_baseline_commit(self.workspace)
+        if pinned_commit:
+            return "skip", f"already pinned at {pinned_commit[:8]} (v{pinned_version})"
+
+        violations = production_kernel_violations(self.workspace, self.framework)
+        progressed = not head_kernel_is_initial_baseline(self.workspace)
+        if not violations and not progressed:
+            return "pin", "the V0 kernel is already a compliant framework implementation"
+        if any(v.startswith("unsupported production framework") for v in violations):
+            return "skip", "; ".join(violations)
+        if self.framework_baseline == "auto" and self.optimization_mode != "production":
+            return "skip", "leaderboard mode keeps the permissive V0 (use --framework-baseline always)"
+        if not progressed:
+            return "run", f"V0 is not a self-contained {self.framework} kernel"
+        if (
+            latest_version(self.workspace) == FRAMEWORK_BASELINE_VERSION
+            and not violations
+            and not (self.workspace / AGGREGATE_DISPATCH_FILE).is_file()
+        ):
+            return "adopt", "an interrupted framework baseline is already committed"
+        return "skip", (
+            "HEAD has progressed beyond V0 without a framework-baseline pin; "
+            "leaving this campaign on its existing baseline"
+        )
+
+    def _single_root_commit(self) -> str:
+        roots = subprocess.run(
+            ["git", "rev-list", "--max-parents=0", "HEAD"],
+            cwd=str(self.workspace), capture_output=True, text=True,
+        )
+        root_commits = roots.stdout.split() if roots.returncode == 0 else []
+        if len(root_commits) != 1:
+            raise RuntimeError("framework baseline requires exactly one V0 root commit")
+        return root_commits[0]
+
+    def _framework_baseline_prompt(self, n: int) -> str:
+        return _render(
+            PROMPTS_DIR / "framework_baseline.md",
+            WORKSPACE=str(self.workspace), N=n, PREV=n - 1,
+            PLATFORM=self.platform, FRAMEWORK=self.framework,
+            ARCH=self.arch or "the runtime GPU arch",
+            NOTES=self.notes,
+            AGENT_RUNTIME=_agent_runtime_directive(self.agent_cli),
+            HARDWARE=hardware_directive(self.platform, self.arch),
+            SANDBOX=self._sandbox_directive(),
+            EVALUATOR=self._evaluator_directive(),
+            MODE_POLICY=self._mode_directive(),
+        )
+
+    def _restore_immutable_baseline_paths(self, root_commit: str) -> list[str]:
+        """Put back any ground-truth file the session edited, and report what was restored.
+
+        A session that "fixes" the harness or memory/v0.json is a compliance problem, but a
+        mechanically repairable one — discarding its kernel over it would throw away hours of
+        work for nothing. Acceptance is decided by the kernel itself.
+        """
+        restored: list[str] = []
+        for path in IMMUTABLE_BASELINE_PATHS:
+            original = git_path_blob(self.workspace, root_commit, path)
+            if not original or original == git_worktree_blob(self.workspace, path):
+                continue
+            checkout = subprocess.run(
+                ["git", "checkout", root_commit, "--", path],
+                cwd=str(self.workspace), check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if checkout.returncode == 0:
+                restored.append(path)
+        return restored
+
+    def _framework_baseline_problem(self, v0_blob: str, root_commit: str) -> str:
+        """Static acceptance checks on the candidate about to be validated and committed.
+
+        Everything is judged from the worktree: that is what the gateway uploads, and it lets a
+        session that wrote the kernel but never committed it still be accepted.
+        """
+        candidate_blob = git_worktree_blob(self.workspace, "kernel.py")
+        if not candidate_blob or candidate_blob == v0_blob:
+            return "the session left the V0 kernel unchanged; no framework implementation was produced"
+        violations = production_kernel_violations(self.workspace, self.framework)
+        if violations:
+            return (
+                f"the candidate is not a self-contained {self.framework} implementation: "
+                + "; ".join(violations)
+            )
+        if self.framework.lower() in {"triton", "gluon"} and kernel_is_gluon(self.workspace):
+            # A Gluon v1 would permanently disarm the orchestrator's mandatory Triton->Gluon latch.
+            return "the framework baseline must be plain Triton; Gluon is a later orchestrator escalation"
+        mutated = [
+            path for path in IMMUTABLE_BASELINE_PATHS
+            if git_path_blob(self.workspace, root_commit, path)
+            and git_path_blob(self.workspace, root_commit, path)
+            != git_worktree_blob(self.workspace, path)
+        ]
+        if mutated:
+            return "the session modified immutable ground truth: " + ", ".join(mutated)
+        return ""
+
+    def _validate_framework_baseline(self, n: int) -> tuple[Optional[dict], str]:
+        """Re-validate the candidate through the gateway: single seed, then five seeds."""
+        stages = (
+            ("single-seed", ["python", "test_kernel.py", "--version", f"v{n}", "--no-memory"]),
+            ("multi-seed", ["python", "test_kernel.py", "--version", f"v{n}",
+                            "--multi-seed", "5", "--no-memory"]),
+        )
+        result: Optional[dict] = None
+        for stage_name, command in stages:
+            try:
+                test = _sandbox_command(
+                    self.workspace,
+                    self.sandbox_hardware,
+                    self.sandbox_profile,
+                    self.sandbox_url,
+                    self.sandbox_timeout,
+                    command,
+                    gateway_kind="run",
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                return None, f"{stage_name} validation failed to run: {exc}"
+            if test.stdout:
+                print(test.stdout, end="" if test.stdout.endswith("\n") else "\n", flush=True)
+            if test.stderr:
+                print(test.stderr, end="" if test.stderr.endswith("\n") else "\n",
+                      file=sys.stderr, flush=True)
+            if test.returncode != 0:
+                return None, f"{stage_name} validation command failed (exit={test.returncode})"
+            try:
+                result = _test_result_from_stdout(test.stdout)
+            except (RuntimeError, json.JSONDecodeError) as exc:
+                return None, f"{stage_name} validation produced no usable result: {exc}"
+            if not result.get("all_pass"):
+                return None, f"{stage_name} correctness validation failed"
+
+        assert result is not None
+        latency = result.get("latency_us_geomean")
+        if not isinstance(latency, (int, float)) or latency <= 0:
+            return None, "validation reported no usable latency_us_geomean"
+        # Bucket baselines are derived from this map, so a missing or re-keyed shape here would
+        # otherwise surface hours later as a hard failure in bucket seeding.
+        baseline_shapes = set(
+            ((read_memory(self.workspace, 0) or {}).get("performance") or {}).get(
+                "latency_us_by_shape", {}
+            )
+        )
+        measured_shapes = set(result.get("latency_us_by_shape") or {})
+        if baseline_shapes and measured_shapes != baseline_shapes:
+            return None, (
+                "latency_us_by_shape does not cover the same workloads as v0 "
+                f"(missing {sorted(baseline_shapes - measured_shapes)}, "
+                f"unexpected {sorted(measured_shapes - baseline_shapes)})"
+            )
+        return result, ""
+
+    def _warn_restored_baseline_paths(self, root_commit: str) -> None:
+        restored = self._restore_immutable_baseline_paths(root_commit)
+        if restored:
+            print(
+                "[orchestrator] framework baseline session edited immutable ground truth; "
+                f"restored from V0: {', '.join(restored)}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _recover_framework_baseline(
+        self, problem: str, v0_blob: str, root_commit: str, pre_head: str
+    ) -> None:
+        """Run one clean recovery session for a rejected candidate."""
+        print(
+            f"[orchestrator] WARNING: framework baseline rejected ({problem}); "
+            "starting one clean recovery session",
+            file=sys.stderr,
+            flush=True,
+        )
+        if pre_head and git_head(self.workspace) != pre_head:
+            # Undo the session's commits, keep its files: the recovery session needs to read them.
+            subprocess.run(["git", "reset", "--soft", pre_head], cwd=str(self.workspace),
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        recovery_prompt = (
+            self._mode_directive()
+            + "\n\n# Recover a rejected framework baseline\n\n"
+            + f"Workspace: `{self.workspace}`\n\n"
+            + "A previous non-interactive session tried to replace the V0 PyTorch wrapper with a "
+            + f"self-contained **{self.framework}** kernel and was rejected: "
+            + f"**{problem}**\n\n"
+            + "Continue from the files already present and finish the job autonomously. Do not ask "
+            + "for confirmation. Keep the algorithm you already have where it is sound, fix the "
+            + "stated problem, validate correctness through the sandbox with `--multi-seed 5`, "
+            + f"write `memory/v{FRAMEWORK_BASELINE_VERSION}.json`, and commit `kernel.py`. Never "
+            + "modify `test_kernel.py`, `reference.py`, `input.py`, `shapes.json`, `memory/v0.json`, "
+            + f"or create `{FRAMEWORK_BASELINE_FILE}`. Do not enter optimization iterations.\n\n"
+            + self._evaluator_directive()
+            + "\n\n"
+            + self._sandbox_directive()
+        )
+        recovery = run_session(
+            self.workspace, recovery_prompt, timeout=self.framework_baseline_timeout,
+            agent_cli=self.agent_cli,
+            sandbox_hardware=self.sandbox_hardware,
+            sandbox_profile=self.sandbox_profile,
+            sandbox_url=self.sandbox_url,
+            sandbox_timeout=self.sandbox_timeout,
+            reasoning_effort="high",
+        )
+        self._account(recovery, f"framework baseline recovery v{FRAMEWORK_BASELINE_VERSION}")
+
+    def _record_framework_baseline_failure(self, problem: str) -> None:
+        """Persist why the framework baseline was rejected, uncommitted so a reset cannot lose it."""
+        n = FRAMEWORK_BASELINE_VERSION
+        memory_path = self.workspace / "memory" / f"v{n}.json"
+        try:
+            memory = json.loads(memory_path.read_text(encoding="utf-8")) if memory_path.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            memory = {}
+        if not isinstance(memory, dict):
+            memory = {}
+        memory["version"] = f"v{n}"
+        memory["masked"] = False
+        memory["git_commit_hash"] = None
+        memory["quality_gate"] = {"result": "FAIL", "failure_reason": problem}
+        memory["correctness"] = {"status": "FAIL"}
+        memory["optimization"] = {
+            "action_category": FRAMEWORK_BASELINE_CATEGORY,
+            "action_description": f"rejected {self.framework} baseline attempt",
+        }
+        pitfalls = memory.setdefault("pitfalls_and_fixes", [])
+        if not isinstance(pitfalls, list):
+            pitfalls = []
+            memory["pitfalls_and_fixes"] = pitfalls
+        pitfalls.append({
+            "error_type": "production_policy" if "self-contained" in problem else "correctness",
+            "error_message": problem,
+            "lesson": f"the next attempt must land a compliant, correctness-passing {self.framework} kernel",
+        })
+        memory_path.parent.mkdir(parents=True, exist_ok=True)
+        memory_path.write_text(json.dumps(memory, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def _commit_framework_baseline(self, n: int, result: dict) -> str:
+        """Commit the accepted kernel (C1) and then pin it in a metadata-only commit (C2)."""
+        staged = [
+            path for path in ("kernel.py", "solution.json", "CLAUDE.md", "README.md",
+                              f"memory/v{n}.json")
+            if (self.workspace / path).exists()
+        ]
+        staged += [
+            str(path.relative_to(self.workspace))
+            for path in sorted(self.workspace.glob(f"plans/v{n}_*.md"))
+        ]
+        subprocess.run(["git", "add", *staged], cwd=str(self.workspace), check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(self.workspace),
+                          check=False).returncode != 0:
+            subprocess.run(
+                ["git", "commit", "-m",
+                 f"v{n}: framework baseline ({self.framework}) replacing the V0 PyTorch wrapper"],
+                cwd=str(self.workspace), check=True, stdout=subprocess.DEVNULL,
+            )
+        kernel_commit = subprocess.run(
+            ["git", "rev-list", "-1", "HEAD", "--", "kernel.py"],
+            cwd=str(self.workspace), capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        if git_kernel_blob(self.workspace) != git_worktree_blob(self.workspace, "kernel.py"):
+            raise RuntimeError(
+                "framework baseline kernel.py differs between the worktree and the commit"
+            )
+
+        _record_local_test_result(self.workspace, f"v{n}", result)
+        memory_path = self.workspace / "memory" / f"v{n}.json"
+        memory = json.loads(memory_path.read_text(encoding="utf-8"))
+        optimization = memory.setdefault("optimization", {})
+        optimization["action_category"] = FRAMEWORK_BASELINE_CATEGORY
+        optimization["action_description"] = (
+            f"first self-contained {self.framework} implementation of the whole operator"
+        )
+        memory["git_commit_hash"] = kernel_commit
+        memory[FRAMEWORK_BASELINE_CATEGORY] = {
+            "framework": self.framework,
+            "validated_stages": ["single-seed", "multi-seed-5"],
+        }
+        memory_path.write_text(json.dumps(memory, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        self._pin_framework_baseline(kernel_commit, version=n)
+        return kernel_commit
+
+    def _pin_framework_baseline(self, commit: str, *, version: int) -> None:
+        """Write and commit the marker that bucket seeding resolves.
+
+        Deliberately a separate commit rather than an amend: amending would rewrite the very
+        commit whose sha the marker records, leaving a dangling pointer. This commit does not
+        touch kernel.py, so it never registers as an optimization win.
+        """
+        marker = {
+            "schema_version": 1,
+            "version": f"v{version}",
+            "framework": self.framework,
+            "platform": self.platform,
+            "arch": self.arch,
+            "commit": commit,
+            "kernel_blob": git_path_blob(self.workspace, commit, "kernel.py"),
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        (self.workspace / FRAMEWORK_BASELINE_FILE).write_text(
+            json.dumps(marker, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        paths = [FRAMEWORK_BASELINE_FILE]
+        if (self.workspace / "memory" / f"v{version}.json").exists():
+            paths.append(f"memory/v{version}.json")
+        subprocess.run(["git", "add", *paths], cwd=str(self.workspace), check=True,
+                       stdout=subprocess.DEVNULL)
+        if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(self.workspace),
+                          check=False).returncode != 0:
+            subprocess.run(
+                ["git", "commit", "-m", f"v{version}: pin framework baseline {commit[:8]}"],
+                cwd=str(self.workspace), check=True, stdout=subprocess.DEVNULL,
+            )
+        # The metadata commit must not read as a stalled optimization round on the next resume.
+        write_stall(self.workspace, 0)
 
     def _record_failed_convert(self, n: int, reason: str) -> None:
         """Persist a failed/reverted triton->gluon conversion as memory/v<N>.json so the NEXT convert
@@ -2339,6 +3099,8 @@ class Campaign:
             )
             self._link_runtime()  # ensure runtime symlinks exist for iteration sessions
 
+        self.ensure_framework_baseline()
+
         if self.optimization_mode == "production" and latest_version(self.workspace) > 0:
             violations = production_kernel_violations(self.workspace, self.framework)
             if violations and not head_kernel_is_initial_baseline(self.workspace):
@@ -2360,27 +3122,33 @@ class Campaign:
         if stall > 0:
             print(f"[orchestrator] stall counter restored: {stall} rounds without progress", flush=True)
         infra_fails = 0  # consecutive sessions that crashed with 0 tokens (auth/infra issue)
-        convert_bails = 0  # consecutive convert sessions that bailed early (low tokens, no gluon)
         n = latest_version(self.workspace)  # 0 after baseline
         mask_half_memory(self.workspace, n)  # also covers resuming an unmasked v100/v200/...
         while True:
+            conversion_pending = should_convert_to_gluon(
+                self.framework,
+                stall,
+                self.convert_after,
+                head_is_gluon=head_kernel_is_gluon(self.workspace),
+            )
             if n >= self.max_iters:
+                if conversion_pending:
+                    raise RuntimeError(
+                        "mandatory Triton->Gluon conversion did not succeed before max-iters"
+                    )
                 return self._finish("budget: max-iters")
             if self.budget_exhausted():
+                if conversion_pending:
+                    raise RuntimeError(
+                        "mandatory Triton->Gluon conversion did not succeed before token-budget"
+                    )
                 return self._finish("budget: token-budget")
 
             n += 1
-            # Triton→Gluon escalation: after `convert_after` stalled triton iterations, spend ONE
-            # session purely converting the kernel to Gluon (no optimization). Gluon is lower-level,
-            # so the following sessions can go further. Re-fires after each `convert_after` stalled
-            # rounds — the cooldown resets on every convert issued, win or lose (see below).
-            do_convert = (
-                self.optimization_mode == "leaderboard"
-                and self.convert_after > 0
-                and _is_triton_family(self.framework)
-                and not kernel_is_gluon(self.workspace)
-                and stall >= self.convert_after
-            )
+            # Triton→Gluon escalation is a latch, not a periodic best-effort attempt. Once
+            # `convert_after` consecutive stalls are reached, every following session is a
+            # convert-only retry until a correctness- and parity-passing Gluon HEAD is committed.
+            do_convert = conversion_pending
             if do_convert:
                 print(f"[orchestrator] triton stalled {stall} iters -> triton->gluon convert session v{n}", flush=True)
                 prompt = _render(PROMPTS_DIR / "convert.md",
@@ -2402,6 +3170,7 @@ class Campaign:
                                  EVALUATOR=self._evaluator_directive(),
                                  MODE_POLICY=self._mode_directive())
             previous_latency = incumbent_latency(self.workspace, n)
+            pre_head_was_gluon = head_kernel_is_gluon(self.workspace)
             pre_head = git_head(self.workspace)  # win = a commit that changes kernel.py vs this
             res = run_session(
                 self.workspace, prompt, timeout=self.iter_timeout,
@@ -2419,33 +3188,44 @@ class Campaign:
             # regularly produced back-to-back non-zero exits with low tokens, killing the
             # whole campaign for a recoverable hiccup. Backoff avoids hammering a
             # rate-limited endpoint.
-            if res.exit_status != 0 and not res.timed_out:
+            if res.exit_status != 0 or res.timed_out:
                 infra_fails += 1
+                if res.timed_out:
+                    backoff = min(60 * infra_fails, 300)
+                    notice = f"timeout #{infra_fails}"
+                else:
+                    backoff = min(30 * infra_fails, 180)
+                    notice = f"infra fail #{infra_fails} (exit={res.exit_status})"
+                if infra_fails < 15:
+                    # Back off before retrying to avoid hammering a rate-limited API
+                    print(f"[orchestrator] {notice}, backing off {backoff}s", flush=True)
+                    time.sleep(backoff)
+                # Recover this round's findings once the endpoint has cooled: a killed session wrote
+                # no memory, and an empty version forces the next session to re-derive everything.
+                self._ensure_iteration_memory(n, res, "convert" if do_convert else "iter")
                 if infra_fails >= 15:
+                    if do_convert:
+                        raise RuntimeError(
+                            "mandatory Triton->Gluon conversion could not complete after "
+                            f"{infra_fails} consecutive failed sessions"
+                        )
+                    if res.timed_out:
+                        return self._finish(f"infra: {infra_fails} consecutive timeouts")
                     return self._finish(
                         f"infra: {infra_fails} consecutive sessions crashed (exit={res.exit_status}) "
                         f"(likely API key / auth issue — {_agent_auth_hint(self.agent_cli)})"
                     )
-                # Back off before retrying to avoid hammering a rate-limited API
-                import time as _time
-                _backoff = min(30 * infra_fails, 180)
-                print(f"[orchestrator] infra fail #{infra_fails} (exit={res.exit_status}), backing off {_backoff}s", flush=True)
-                _time.sleep(_backoff)
-            elif res.exit_status != 0 and res.timed_out:
-                infra_fails += 1
-                if infra_fails >= 15:
-                    return self._finish(f"infra: {infra_fails} consecutive timeouts")
-                import time as _time
-                _backoff = min(60 * infra_fails, 300)
-                print(f"[orchestrator] timeout #{infra_fails}, backing off {_backoff}s", flush=True)
-                _time.sleep(_backoff)
             else:
                 infra_fails = 0
 
             mem = read_memory(self.workspace, n)
             won = kernel_won(self.workspace, pre_head)  # git-native "committed a kernel.py win" — reused below
             if won and self.optimization_mode == "production":
-                violations = production_kernel_violations(self.workspace, self.framework)
+                violations = production_kernel_violations(
+                    self.workspace,
+                    self.framework,
+                    require_gluon=pre_head_was_gluon,
+                )
                 if violations:
                     reject_production_commit(self.workspace, n, pre_head, violations)
                     print(
@@ -2459,8 +3239,9 @@ class Campaign:
             if do_convert:
                 # A direct triton->gluon translation must preserve BOTH correctness and performance.
                 # Accept only a committed gluon kernel whose geomean is within +CONVERT_PERF_TOL of the
-                # incumbent triton HEAD. Otherwise reject, keep triton, and record WHY — then let triton
-                # run another `convert_after` stalled rounds and RETRY conversion (informed by the record).
+                # incumbent triton HEAD. Otherwise reject, keep triton, record WHY, and immediately
+                # retry conversion in the next clean session. Ordinary Triton optimization stays
+                # disabled until conversion succeeds.
                 # Accept only when the COMMITTED HEAD kernel is gluon, correctness PASSed, and geomean is
                 # within +CONVERT_PERF_TOL of the incumbent triton HEAD. Detect the committed gluon via git
                 # HEAD (not memory's git_commit_hash, which a session may leave unset even after committing).
@@ -2484,39 +3265,50 @@ class Campaign:
                         )
                     mask_half_memory(self.workspace, n)
                     continue
-                # rejected: if a bad gluon kernel got committed as HEAD, revert to the triton incumbent
-                # (pre_head — the HEAD before this convert session, which is always the best triton kernel)
-                if head_gluon and pre_head:
+                # Revert every rejected kernel-changing conversion commit, including a session that
+                # incorrectly committed another Triton kernel.  The next clean attempt must always
+                # start from the same accepted Triton incumbent until a Gluon candidate passes.
+                if won and pre_head:
                     subprocess.run(["git", "reset", "--hard", pre_head], cwd=str(self.workspace),
                                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    reason = (f"regressed {conv_lat / prev_best - 1:+.1%} vs triton (> {CONVERT_PERF_TOL:.0%})"
-                              if isinstance(conv_lat, (int, float)) and prev_best and not parity_ok
-                              else "correctness gate not PASS")
+                    if not head_gluon:
+                        reason = "convert session committed a non-Gluon kernel"
+                    elif isinstance(conv_lat, (int, float)) and prev_best and not parity_ok:
+                        reason = (
+                            f"regressed {conv_lat / prev_best - 1:+.1%} vs triton "
+                            f"(> {CONVERT_PERF_TOL:.0%})"
+                        )
+                    else:
+                        reason = "correctness gate not PASS"
                     self._record_failed_convert(n, reason)
                     print(f"[orchestrator] convert rejected ({reason}); reverted to triton HEAD {pre_head[:8]}", flush=True)
                 else:
+                    # A session may leave an uncommitted Gluon edit behind. Restore the committed
+                    # Triton/record HEAD before retrying so every attempt starts from auditable state.
+                    if kernel_is_gluon(self.workspace) and not head_gluon:
+                        subprocess.run(
+                            ["git", "reset", "--hard", "HEAD"],
+                            cwd=str(self.workspace),
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
                     if read_memory(self.workspace, n) is None:
                         self._record_failed_convert(n, "convert session produced no committed gluon kernel")
-                    print("[orchestrator] convert produced no committed gluon kernel; staying on triton", flush=True)
-                # Classify the failed convert. A "bail" (session barely ran — low tokens AND no gluon)
-                # is a model-compliance failure (e.g. launched work then exited), not a genuinely hard
-                # conversion. Retrying it identically just loops forever, so after a few bails disable
-                # the escalation and stay triton-only rather than burning cooldown cycles for nothing.
-                # A genuine attempt (did real work: extracted TTGIR, rewrote, validated) uses many tokens
-                # even when it fails parity — that resets the streak and keeps the learning-retry path.
+                    print(
+                        "[orchestrator] convert produced no committed gluon kernel; "
+                        "mandatory conversion remains latched",
+                        flush=True,
+                    )
                 if res.tokens < CONVERT_MIN_TOKENS:
-                    convert_bails += 1
-                    print(f"[orchestrator] convert v{n} bailed early ({res.tokens} tokens, no gluon) "
-                          f"[{convert_bails}/{CONVERT_MAX_BAILS}]", flush=True)
-                    if convert_bails >= CONVERT_MAX_BAILS:
-                        self.convert_after = 0  # disable escalation for the rest of this run
-                        print("[orchestrator] convert repeatedly bailed -> disabling triton->gluon "
-                              "escalation; continuing triton-only", flush=True)
-                else:
-                    convert_bails = 0
-                # A convert was issued -> reset the cooldown regardless of outcome; conversion
-                # re-fires only after another `convert_after` stalled rounds.
-                stall = 0
+                    print(
+                        f"[orchestrator] convert v{n} ended shallowly ({res.tokens} tokens, no gluon); "
+                        "retrying conversion next session",
+                        flush=True,
+                    )
+                # Preserve the reached threshold. This makes the next loop iteration another
+                # conversion attempt rather than returning to Triton optimization.
+                stall = max(stall, self.convert_after)
                 write_stall(self.workspace, stall)
                 self._notify_iteration(n, read_memory(self.workspace, n), False)
                 mask_half_memory(self.workspace, n)
@@ -2536,7 +3328,13 @@ class Campaign:
                 stall += 1
                 write_stall(self.workspace, stall)
                 self._notify_iteration(n, mem, False)
-                if self.max_stall > 0 and stall >= self.max_stall:
+                conversion_now_required = should_convert_to_gluon(
+                    self.framework,
+                    stall,
+                    self.convert_after,
+                    head_is_gluon=head_kernel_is_gluon(self.workspace),
+                )
+                if self.max_stall > 0 and stall >= self.max_stall and not conversion_now_required:
                     mask_half_memory(self.workspace, n)
                     return self._finish(f"stall: {stall} iterations with no commit")
             mask_half_memory(self.workspace, n)
@@ -2652,7 +3450,11 @@ def _read_workload_source(op_dir: Path) -> WorkloadSource:
 
 
 def validate_workload_buckets(
-    manifest: object, workload_count: int, max_buckets: int
+    manifest: object,
+    workload_count: int,
+    max_buckets: int,
+    *,
+    require_visibility_policy: bool = False,
 ) -> list[WorkloadBucket]:
     """Validate the inspector contract and return normalized buckets.
 
@@ -2665,6 +3467,17 @@ def validate_workload_buckets(
         raise ValueError(f"{WORKLOAD_BUCKETS_FILE} must contain a top-level buckets list")
     if isinstance(manifest.get("schema_version"), bool) or manifest.get("schema_version") != 1:
         raise ValueError(f"{WORKLOAD_BUCKETS_FILE} schema_version must be 1")
+    visibility_policy = manifest.get("dispatch_visibility_policy")
+    if visibility_policy not in (None, DISPATCH_VISIBILITY_POLICY):
+        raise ValueError(
+            f"{WORKLOAD_BUCKETS_FILE} dispatch visibility policy is unsupported: "
+            f"{visibility_policy!r}"
+        )
+    if require_visibility_policy and visibility_policy != DISPATCH_VISIBILITY_POLICY:
+        raise ValueError(
+            f"{WORKLOAD_BUCKETS_FILE} must declare dispatch_visibility_policy="
+            f"{DISPATCH_VISIBILITY_POLICY!r}"
+        )
     if (
         isinstance(manifest.get("workload_count"), bool)
         or manifest.get("workload_count") != workload_count
@@ -2726,6 +3539,7 @@ def validate_workload_buckets(
 def _normalized_bucket_manifest(buckets: list[WorkloadBucket], workload_count: int) -> dict:
     return {
         "schema_version": 1,
+        "dispatch_visibility_policy": DISPATCH_VISIBILITY_POLICY,
         "workload_count": workload_count,
         "buckets": [
             {
@@ -2790,6 +3604,136 @@ def _materialize_bucket_op(
             )
 
 
+def _bucket_baseline_memory(
+    aggregate_memory: dict,
+    bucket: WorkloadBucket,
+    workload_source: WorkloadSource,
+    *,
+    aggregate_workspace: Path,
+    aggregate_baseline_commit: str,
+    aggregate_baseline_version: int = 0,
+) -> dict:
+    """Derive one bucket's V0 record from the aggregate baseline measurement.
+
+    The aggregate evaluator already measured every workload independently and
+    persisted those measurements in ``latency_us_by_shape``.  Re-running the
+    same baseline once per bucket wastes both coding-agent and GPU time.  A
+    bucket baseline is therefore the exact subset of those measurements, with
+    scalar latency aggregates recomputed over only that subset.
+
+    The source is the aggregate framework baseline when the campaign pinned one, otherwise
+    the original V0 record.
+    """
+    performance = aggregate_memory.get("performance") or {}
+    per_workload = performance.get("latency_us_by_shape")
+    if not isinstance(per_workload, dict):
+        raise RuntimeError(
+            f"aggregate memory/v{aggregate_baseline_version}.json has no "
+            "performance.latency_us_by_shape; cannot derive bucket baselines without re-running it"
+        )
+
+    selected: dict[str, float] = {}
+    selected_ids: list[str] = []
+    ordered_keys = list(per_workload)
+    for index in bucket.workload_indices:
+        entry = workload_source.entries[index]
+        candidates = [workload_source.ids[index]]
+        for field_name in ("uuid", "id"):
+            value = entry.get(field_name)
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                candidates.append(str(value))
+        key = next((candidate for candidate in candidates if candidate in per_workload), None)
+        # Older SOL records can be keyed by evaluator UUID while the source view
+        # exposes only ordinal ids.  Equal cardinality makes the evaluator's
+        # stable insertion order an unambiguous final fallback.
+        if key is None and len(ordered_keys) == len(workload_source.entries):
+            key = ordered_keys[index]
+        if key is None:
+            raise RuntimeError(
+                f"aggregate V0 has no per-workload latency for bucket {bucket.name!r} "
+                f"workload index {index}"
+            )
+        latency = per_workload.get(key)
+        if (
+            isinstance(latency, bool)
+            or not isinstance(latency, (int, float))
+            or not math.isfinite(float(latency))
+            or float(latency) <= 0
+        ):
+            raise RuntimeError(
+                f"aggregate V0 latency for workload {key!r} is not a positive finite number"
+            )
+        selected[str(key)] = float(latency)
+        selected_ids.append(str(key))
+
+    latencies = list(selected.values())
+    geomean = (
+        latencies[0]
+        if len(latencies) == 1
+        else math.exp(sum(math.log(value) for value in latencies) / len(latencies))
+    )
+    arithmetic_mean = sum(latencies) / len(latencies)
+    # JSON round-tripping gives a deep copy while also guaranteeing the derived
+    # record remains JSON serializable like every other memory entry.
+    derived = json.loads(json.dumps(aggregate_memory))
+    derived["version"] = "v0"
+    derived["masked"] = False
+    derived["timestamp"] = datetime.now(timezone.utc).isoformat()
+    # A bucket baseline is neither the campaign's framework baseline nor an aggregate candidate.
+    derived.pop(FRAMEWORK_BASELINE_CATEGORY, None)
+    derived.pop("aggregation", None)
+    derived_performance = derived.setdefault("performance", {})
+    derived_performance["latency_us"] = geomean
+    derived_performance["latency_us_geomean"] = geomean
+    derived_performance["latency_us_arith_mean"] = arithmetic_mean
+    derived_performance["latency_us_by_shape"] = selected
+    derived_performance["derived_from_aggregate_v0"] = True
+    derived_performance["derived_from_aggregate_version"] = f"v{aggregate_baseline_version}"
+    derived_performance["aggregate_v0_latency_us"] = performance.get("latency_us")
+    derived_performance["aggregate_baseline_latency_us"] = performance.get("latency_us")
+    # Throughput/utilization scalars in aggregate V0 were reduced over the full
+    # workload set.  They are not mathematically valid for a subset and could
+    # incorrectly trip the bucket's peak-utilization stop condition.
+    for aggregate_only_metric in (
+        "tflops",
+        "bandwidth_gbps",
+        "tflops_peak_utilization_pct",
+        "bandwidth_peak_utilization_pct",
+        "speedup_vs_ref_geomean",
+    ):
+        derived_performance.pop(aggregate_only_metric, None)
+    source_label = (
+        f"framework baseline v{aggregate_baseline_version}"
+        if aggregate_baseline_version > 0
+        else "V0"
+    )
+    derived_performance["measurement_note"] = (
+        f"Mechanically selected aggregate {source_label} per-workload timings for bucket "
+        f"{bucket.name}; no separate baseline evaluation was run."
+    )
+    optimization = derived.setdefault("optimization", {})
+    optimization["action_category"] = "baseline"
+    optimization["action_description"] = (
+        f"V0 mechanically derived from aggregate {source_label} for bucket {bucket.name}; "
+        f"selected workloads: {', '.join(selected_ids)}. No separate baseline session "
+        "or GPU evaluation was run."
+    )
+    derived["baseline_derivation"] = {
+        "source": (
+            "aggregate_framework_baseline" if aggregate_baseline_version > 0 else "aggregate_v0"
+        ),
+        "aggregate_workspace": str(aggregate_workspace),
+        "aggregate_v0_commit": aggregate_baseline_commit,
+        "aggregate_baseline_commit": aggregate_baseline_commit,
+        "aggregate_baseline_version": f"v{aggregate_baseline_version}",
+        "bucket": bucket.name,
+        "workload_indices": list(bucket.workload_indices),
+        "workload_ids": selected_ids,
+    }
+    derived["git_commit_hash"] = None
+    return derived
+
+
 def _freeze_dispatch_signature(value: object) -> object:
     """Convert JSON arrays into hashable tuples while preserving scalars."""
     if isinstance(value, list):
@@ -2799,6 +3743,114 @@ def _freeze_dispatch_signature(value: object) -> object:
             (key, _freeze_dispatch_signature(value[key])) for key in sorted(value)
         )
     return value
+
+
+def _validate_dispatch_value_signature(value: object, path: str) -> None:
+    """Validate one no-sync, production-visible value signature.
+
+    Tensor signatures intentionally contain metadata only.  A cached or agent-edited
+    signature cannot add tensor values, summaries, pointers, or other evaluator-only
+    information and later smuggle it into the generated production dispatcher.
+    """
+    if not isinstance(value, list) or not value or not isinstance(value[0], str):
+        raise ValueError(f"{path} is not a tagged dispatch value signature")
+    tag = value[0]
+    if tag == "tensor":
+        if len(value) != 6:
+            raise ValueError(
+                f"{path} tensor signature must contain only shape/stride/dtype/layout/requires_grad"
+            )
+        shape, stride, dtype, layout, requires_grad = value[1:]
+        if (
+            not isinstance(shape, list)
+            or any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in shape)
+        ):
+            raise ValueError(f"{path} tensor shape is invalid")
+        if (
+            not isinstance(stride, list)
+            or len(stride) != len(shape)
+            or any(isinstance(item, bool) or not isinstance(item, int) for item in stride)
+        ):
+            raise ValueError(f"{path} tensor stride is invalid")
+        if not isinstance(dtype, str) or not isinstance(layout, str):
+            raise ValueError(f"{path} tensor dtype/layout is invalid")
+        if not isinstance(requires_grad, bool):
+            raise ValueError(f"{path} tensor requires_grad flag is invalid")
+        return
+    if tag == "none":
+        if len(value) != 1:
+            raise ValueError(f"{path} none signature has extra data")
+        return
+    if tag == "bool":
+        if len(value) != 2 or not isinstance(value[1], bool):
+            raise ValueError(f"{path} bool signature is invalid")
+        return
+    if tag == "int":
+        if len(value) != 2 or isinstance(value[1], bool) or not isinstance(value[1], int):
+            raise ValueError(f"{path} int signature is invalid")
+        return
+    if tag == "float":
+        if len(value) != 2 or not isinstance(value[1], str):
+            raise ValueError(f"{path} float signature is invalid")
+        rendered = value[1]
+        if rendered not in {"nan", "inf", "-inf"}:
+            try:
+                float.fromhex(rendered)
+            except ValueError as exc:
+                raise ValueError(f"{path} float signature is invalid") from exc
+        return
+    if tag in {"str", "torch.dtype"}:
+        if len(value) != 2 or not isinstance(value[1], str):
+            raise ValueError(f"{path} {tag} signature is invalid")
+        return
+    if tag in {"tuple", "list"}:
+        if len(value) != 2 or not isinstance(value[1], list):
+            raise ValueError(f"{path} {tag} signature is invalid")
+        for index, item in enumerate(value[1]):
+            _validate_dispatch_value_signature(item, f"{path}[{index}]")
+        return
+    if tag == "dict":
+        if len(value) != 2 or not isinstance(value[1], list):
+            raise ValueError(f"{path} dict signature is invalid")
+        keys: list[str] = []
+        for index, item in enumerate(value[1]):
+            if (
+                not isinstance(item, list)
+                or len(item) != 2
+                or not isinstance(item[0], str)
+            ):
+                raise ValueError(f"{path} dict entry {index} is invalid")
+            keys.append(item[0])
+            _validate_dispatch_value_signature(item[1], f"{path}.{item[0]}")
+        if keys != sorted(set(keys)):
+            raise ValueError(f"{path} dict keys must be unique and sorted")
+        return
+    raise ValueError(f"{path} uses unsupported dispatch signature tag {tag!r}")
+
+
+def _validate_invocation_signature(value: object, path: str) -> None:
+    if (
+        not isinstance(value, list)
+        or len(value) != 3
+        or value[0] != "invocation"
+        or not isinstance(value[1], list)
+        or not isinstance(value[2], list)
+    ):
+        raise ValueError(f"{path} is not a valid invocation signature")
+    for index, item in enumerate(value[1]):
+        _validate_dispatch_value_signature(item, f"{path}.args[{index}]")
+    names: list[str] = []
+    for index, item in enumerate(value[2]):
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+        ):
+            raise ValueError(f"{path}.kwargs[{index}] is invalid")
+        names.append(item[0])
+        _validate_dispatch_value_signature(item[1], f"{path}.kwargs.{item[0]}")
+    if names != sorted(set(names)):
+        raise ValueError(f"{path} keyword names must be unique and sorted")
 
 
 def validate_dispatch_signatures(
@@ -2815,6 +3867,12 @@ def validate_dispatch_signatures(
         raise ValueError(
             f"{DISPATCH_SIGNATURES_FILE} workload source does not match "
             f"{workload_source.filename}"
+        )
+    visibility_policy = payload.get("visibility_policy")
+    if visibility_policy not in (None, DISPATCH_VISIBILITY_POLICY):
+        raise ValueError(
+            f"{DISPATCH_SIGNATURES_FILE} visibility policy is unsupported: "
+            f"{visibility_policy!r}"
         )
     records = payload.get("workloads")
     if not isinstance(records, list) or len(records) != len(workload_source.entries):
@@ -2835,6 +3893,8 @@ def validate_dispatch_signatures(
             record.get("call"), list
         ):
             raise ValueError(f"dispatch signature record {index} is missing init/call")
+        _validate_invocation_signature(record["init"], f"workloads[{index}].init")
+        _validate_invocation_signature(record["call"], f"workloads[{index}].call")
         normalized.append(
             {
                 "index": index,
@@ -2888,6 +3948,25 @@ def _git_head_file(workspace: Path, relative_path: str) -> str:
     if result.returncode != 0:
         raise RuntimeError(
             f"could not read committed {relative_path} from {workspace}: "
+            f"{result.stderr.strip()}"
+        )
+    return result.stdout
+
+
+def _git_blob_file(workspace: Path, blob_hash: object) -> str:
+    """Read an exact previously recorded bucket kernel blob."""
+    value = str(blob_hash or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", value):
+        raise RuntimeError(f"invalid recorded kernel blob: {blob_hash!r}")
+    result = subprocess.run(
+        ["git", "cat-file", "blob", value],
+        cwd=str(workspace),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"could not read recorded kernel blob {value} from {workspace}: "
             f"{result.stderr.strip()}"
         )
     return result.stdout
@@ -2972,9 +4051,12 @@ def build_deterministic_dispatcher(
     signature_records: list[dict],
     bucket_by_index: dict[int, str],
     module_records: dict[str, dict],
+    module_sources: dict[str, str],
 ) -> str:
-    """Generate a static dispatcher; no model or source-code reasoning is involved."""
+    """Generate one self-contained kernel.py with statically embedded buckets."""
     bucket_names = sorted(module_records)
+    if set(module_sources) != set(bucket_names):
+        raise ValueError("embedded aggregate source set does not match module records")
     bucket_indices = {name: index for index, name in enumerate(bucket_names)}
     signature_map: dict[object, int] = {}
     for record in signature_records:
@@ -2984,40 +4066,26 @@ def build_deterministic_dispatcher(
         )
         signature_map[key] = bucket_indices[bucket_by_index[int(record["index"])]]
 
-    loaders = []
-    for index, name in enumerate(bucket_names):
-        module_path = str(module_records[name].get("path") or "")
-        module_name = Path(module_path).stem if module_path else name
-        if not module_name.isidentifier():
-            raise ValueError(f"invalid deterministic dispatch module name: {module_name}")
-        loaders.append(
-            f"def _load_bucket_{index}():\n"
-            f"    from {AGGREGATE_KERNELS_DIR} import {module_name} as bucket_module\n"
-            "    return bucket_module\n"
-        )
-    loader_tuple = ", ".join(f"_load_bucket_{index}" for index in range(len(bucket_names)))
+    entry_name = "Model" if kind == "shapes" else "run" if kind == "sol" else ""
+    if not entry_name:
+        raise ValueError(f"unsupported deterministic dispatch kind: {kind}")
+    embedded = embed_bucket_sources(module_sources, entry_name=entry_name)
     blob_map = {
         name: str(module_records[name].get("kernel_blob") or "")
         for name in bucket_names
     }
     header = (
         "# Generated by orchestrator/optimize.py. Do not edit.\n"
-        "# Deterministic workload dispatcher over independently validated bucket kernels.\n"
+        "# Self-contained deterministic dispatcher over independently validated bucket kernels.\n"
+        f"from __future__ import {', '.join(embedded.future_features)}\n\n"
         "import math\n"
         "import torch\n\n"
+        + "\n\n".join(embedded.blocks)
+        + "\n\n"
         + _generated_dispatch_runtime()
         + "\n\n"
-        + "\n".join(loaders)
-        + f"\n_BUCKET_LOADERS = ({loader_tuple},)\n"
         + f"_BUCKET_KERNEL_BLOBS = {blob_map!r}\n"
         + f"_SIGNATURE_TO_BUCKET = {signature_map!r}\n"
-        + "_BUCKET_MODULE_CACHE = [None] * len(_BUCKET_LOADERS)\n\n"
-        + "def _bucket_module(index):\n"
-        + "    module = _BUCKET_MODULE_CACHE[index]\n"
-        + "    if module is None:\n"
-        + "        module = _BUCKET_LOADERS[index]()\n"
-        + "        _BUCKET_MODULE_CACHE[index] = module\n"
-        + "    return module\n\n"
         + "def _select_bucket(init_signature, args, kwargs):\n"
         + "    signature = (init_signature, _invocation_signature(args, kwargs))\n"
         + "    index = _SIGNATURE_TO_BUCKET.get(signature)\n"
@@ -3026,7 +4094,8 @@ def build_deterministic_dispatcher(
         + "    return index\n\n"
     )
     if kind == "shapes":
-        return header + '''
+        models = ", ".join(embedded.entry_symbols)
+        return header + f"_BUCKET_MODELS = ({models},)\n\n" + '''
 class Model(torch.nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -3039,8 +4108,7 @@ class Model(torch.nn.Module):
         index = _select_bucket(self._dispatch_init_signature, args, kwargs)
         key = str(index)
         if key not in self._dispatch_models:
-            module = _bucket_module(index)
-            candidate = module.Model(
+            candidate = _BUCKET_MODELS[index](
                 *self._dispatch_init_args, **self._dispatch_init_kwargs
             )
             if not isinstance(candidate, torch.nn.Module):
@@ -3058,12 +4126,13 @@ class Model(torch.nn.Module):
             (),
             (),
         )
-        return header + f'''
+        runners = ", ".join(embedded.entry_symbols)
+        return header + f"_BUCKET_RUNNERS = ({runners},)\n\n" + f'''
 def run(*args, **kwargs):
     index = _select_bucket({empty_init!r}, args, kwargs)
-    return _bucket_module(index).run(*args, **kwargs)
+    return _BUCKET_RUNNERS[index](*args, **kwargs)
 '''.lstrip()
-    raise ValueError(f"unsupported deterministic dispatch kind: {kind}")
+    raise AssertionError("unreachable")
 
 
 @dataclass
@@ -3115,6 +4184,10 @@ class WorkloadBucketCoordinator:
                     f"{ignore_line}\n"
                 )
         self._commit_main("workload coordinator: ignore derived bucket workspaces", ".gitignore")
+        # Buckets inherit this kernel, so the framework bring-up happens once here rather than
+        # once per bucket. Ordered after the ignore rule: the session must never stage the
+        # nested bucket repositories of a resumed campaign.
+        self.aggregate_campaign.ensure_framework_baseline()
 
     def _commit_main(self, message: str, *paths: str) -> None:
         subprocess.run(["git", "add", "--", *paths], cwd=str(self.workspace), check=True)
@@ -3141,7 +4214,28 @@ class WorkloadBucketCoordinator:
                 payload = json.loads(signature_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise RuntimeError(f"invalid {signature_path}: {exc}") from exc
-            return validate_dispatch_signatures(payload, workload_source)
+            records = validate_dispatch_signatures(payload, workload_source)
+            if payload.get("visibility_policy") != DISPATCH_VISIBILITY_POLICY:
+                signature_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "visibility_policy": DISPATCH_VISIBILITY_POLICY,
+                            "kind": workload_source.kind,
+                            "workload_source": workload_source.filename,
+                            "workloads": records,
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self._commit_main(
+                    "workload inspector: certify no-sync dispatch signatures",
+                    DISPATCH_SIGNATURES_FILE,
+                )
+            return records
 
         timeout = max(
             self.aggregate_campaign.sandbox_timeout,
@@ -3162,6 +4256,7 @@ class WorkloadBucketCoordinator:
                 ],
                 wall_timeout=timeout + AGGREGATE_QUEUE_WAIT_GRACE,
                 dispatch_signatures=True,
+                gateway_kind="dev",
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError(f"dispatch signature collection failed to run: {exc}") from exc
@@ -3191,6 +4286,7 @@ class WorkloadBucketCoordinator:
         records = validate_dispatch_signatures(payload, workload_source)
         persisted = {
             "schema_version": 1,
+            "visibility_policy": DISPATCH_VISIBILITY_POLICY,
             "kind": workload_source.kind,
             "workload_source": workload_source.filename,
             "workloads": records,
@@ -3218,6 +4314,40 @@ class WorkloadBucketCoordinator:
             manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
             buckets = validate_workload_buckets(manifest, workload_count, self.max_buckets)
             validate_dispatch_bucket_compatibility(buckets, signature_records)
+            if manifest.get("dispatch_visibility_policy") != DISPATCH_VISIBILITY_POLICY:
+                # A legacy partition is still mechanically safe when every exact
+                # production-visible signature has one owner. Remove rationales that may
+                # have cited evaluator-only values and certify the partition under the
+                # current no-sync policy without renaming its existing bucket workspaces.
+                buckets = [
+                    WorkloadBucket(
+                        name=bucket.name,
+                        workload_indices=bucket.workload_indices,
+                        rationale=(
+                            "Legacy partition revalidated as a union of exact "
+                            f"{DISPATCH_VISIBILITY_POLICY} signature classes; no tensor "
+                            "contents or workload-source values are dispatch inputs."
+                        ),
+                    )
+                    for bucket in buckets
+                ]
+                self.manifest_path.write_text(
+                    json.dumps(
+                        {
+                            **_normalized_bucket_manifest(buckets, workload_count),
+                            "workload_source": workload_source.filename,
+                            "workload_ids": list(workload_source.ids),
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self._commit_main(
+                    "workload inspector: certify production-visible bucket partition",
+                    WORKLOAD_BUCKETS_FILE,
+                )
             print(
                 f"[workload-inspector] reusing {len(buckets)} validated buckets from "
                 f"{self.manifest_path}",
@@ -3225,20 +4355,46 @@ class WorkloadBucketCoordinator:
             )
             return buckets
 
-        prompt = _render(
-            PROMPTS_DIR / "inspect_workloads.md",
-            WORKSPACE=str(self.workspace),
-            MAX_BUCKETS=self.max_buckets,
-            WORKLOAD_COUNT=workload_count,
-            WORKLOAD_FILE=workload_source.filename,
-            WORKLOAD_KIND=workload_source.kind,
-            PLATFORM=self.aggregate_campaign.platform,
-            FRAMEWORK=self.aggregate_campaign.framework,
-        )
-        pre_head = git_head(self.workspace)
-        try:
+        # The LLM inspector runs in a data-minimized workspace. It receives only the
+        # signatures the generated production dispatcher can recompute without a device
+        # synchronization; reference.py, input.py, shapes.json/workload.jsonl, tensor
+        # contents, and evaluator metadata are not present.
+        with tempfile.TemporaryDirectory(prefix="atrex-dispatch-inspector-") as temp_dir:
+            inspector_workspace = Path(temp_dir)
+            inspector_signature_path = inspector_workspace / DISPATCH_SIGNATURES_FILE
+            inspector_signature_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "visibility_policy": DISPATCH_VISIBILITY_POLICY,
+                        "kind": workload_source.kind,
+                        "workload_source": workload_source.filename,
+                        "workloads": signature_records,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "init", "--quiet"],
+                cwd=str(inspector_workspace),
+                check=True,
+            )
+            prompt = _render(
+                PROMPTS_DIR / "inspect_workloads.md",
+                WORKSPACE=str(inspector_workspace),
+                MAX_BUCKETS=self.max_buckets,
+                WORKLOAD_COUNT=workload_count,
+                WORKLOAD_FILE=workload_source.filename,
+                WORKLOAD_KIND=workload_source.kind,
+                VISIBILITY_POLICY=DISPATCH_VISIBILITY_POLICY,
+                PLATFORM=self.aggregate_campaign.platform,
+                FRAMEWORK=self.aggregate_campaign.framework,
+            )
             result = run_session(
-                self.workspace,
+                inspector_workspace,
                 prompt,
                 timeout=self.aggregate_campaign.setup_timeout,
                 agent_cli=self.aggregate_campaign.agent_cli,
@@ -3247,27 +4403,13 @@ class WorkloadBucketCoordinator:
                 sandbox_url=self.aggregate_campaign.sandbox_url,
                 sandbox_timeout=self.aggregate_campaign.sandbox_timeout,
             )
-        except Exception:
-            if pre_head:
-                subprocess.run(
-                    ["git", "reset", "--hard", pre_head],
-                    cwd=str(self.workspace),
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                )
-            raise
-        self._account(result, "workload inspector")
-        manifest_text = self.manifest_path.read_text(encoding="utf-8") if self.manifest_path.exists() else ""
-
-        # The inspector is analysis-only.  Preserve only its validated manifest,
-        # even if the coding CLI edited or committed unrelated workspace files.
-        if pre_head:
-            subprocess.run(
-                ["git", "reset", "--hard", pre_head],
-                cwd=str(self.workspace),
-                check=True,
-                stdout=subprocess.DEVNULL,
+            inspector_manifest_path = inspector_workspace / WORKLOAD_BUCKETS_FILE
+            manifest_text = (
+                inspector_manifest_path.read_text(encoding="utf-8")
+                if inspector_manifest_path.exists()
+                else ""
             )
+        self._account(result, "workload inspector")
         if result.exit_status != 0 or result.timed_out:
             raise RuntimeError(
                 f"workload inspector failed (exit={result.exit_status}, timed_out={result.timed_out})"
@@ -3278,7 +4420,12 @@ class WorkloadBucketCoordinator:
             manifest = json.loads(manifest_text)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"workload inspector produced invalid JSON: {exc}") from exc
-        buckets = validate_workload_buckets(manifest, workload_count, self.max_buckets)
+        buckets = validate_workload_buckets(
+            manifest,
+            workload_count,
+            self.max_buckets,
+            require_visibility_policy=True,
+        )
         validate_dispatch_bucket_compatibility(buckets, signature_records)
         self.manifest_path.write_text(
             json.dumps(
@@ -3455,6 +4602,9 @@ class WorkloadBucketCoordinator:
         if (
             bootstrap.get("status") == "REJECTED"
             and bootstrap.get("source_kernel_blobs") == fingerprint
+            and bootstrap.get("dispatch_schema_version")
+            == AGGREGATE_DISPATCH_SCHEMA_VERSION
+            and bootstrap.get("source_layout") == AGGREGATE_SOURCE_LAYOUT
         ):
             return False
         print(
@@ -3578,7 +4728,7 @@ class WorkloadBucketCoordinator:
         *,
         initial: bool,
     ) -> None:
-        """Copy committed bucket kernels and generate an exact static dispatcher."""
+        """Embed committed bucket kernels into one exact static kernel.py."""
         workload_source, buckets, signatures = self._dispatch_inputs()
         expected_names = {bucket.name for bucket in buckets}
         module_dir = self.workspace / AGGREGATE_KERNELS_DIR
@@ -3595,6 +4745,8 @@ class WorkloadBucketCoordinator:
                 raise RuntimeError(f"invalid accepted dispatcher manifest: {exc}") from exc
             if existing_manifest.get("mode") != "deterministic_dispatch":
                 raise RuntimeError("accepted aggregate is not a deterministic dispatcher")
+            if existing_manifest.get("schema_version") not in {1, 2}:
+                raise RuntimeError("accepted dispatcher has an unsupported schema")
             raw_modules = existing_manifest.get("modules")
             if not isinstance(raw_modules, dict):
                 raise RuntimeError("accepted dispatcher manifest has no modules")
@@ -3603,42 +4755,16 @@ class WorkloadBucketCoordinator:
                 for name, record in raw_modules.items()
                 if isinstance(record, dict)
             }
-        else:
-            if module_dir.exists():
-                shutil.rmtree(module_dir)
 
-        module_dir.mkdir(parents=True, exist_ok=True)
-        (module_dir / "__init__.py").write_text(
-            "# Orchestrator-managed deterministic aggregate bucket modules.\n",
-            encoding="utf-8",
-        )
         module_records = existing_records
+        module_sources: dict[str, str] = {}
         for source_bucket, source_campaign, source_version, _source_memory in sources:
             if source_bucket.name not in expected_names:
                 raise RuntimeError(f"unknown aggregate bucket: {source_bucket.name}")
             source = _git_head_file(source_campaign.workspace, "kernel.py")
-            try:
-                tree = ast.parse(source, filename=f"{source_bucket.name}/kernel.py")
-            except SyntaxError as exc:
-                raise RuntimeError(
-                    f"bucket {source_bucket.name} committed kernel is invalid Python: {exc}"
-                ) from exc
-            expected_symbol = "Model" if workload_source.kind == "shapes" else "run"
-            has_entry = any(
-                isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.name == expected_symbol
-                for node in tree.body
-            )
-            if not has_entry:
-                raise RuntimeError(
-                    f"bucket {source_bucket.name} kernel has no top-level {expected_symbol}"
-                )
-            relative_path = (
-                f"{AGGREGATE_KERNELS_DIR}/bucket_{source_bucket.name}.py"
-            )
-            (self.workspace / relative_path).write_text(source, encoding="utf-8")
+            module_sources[source_bucket.name] = source
             module_records[source_bucket.name] = {
-                "path": relative_path,
+                "embedded": True,
                 "bucket_version": f"v{source_version}",
                 "bucket_head": git_head(source_campaign.workspace),
                 "kernel_blob": git_kernel_blob(source_campaign.workspace),
@@ -3650,10 +4776,26 @@ class WorkloadBucketCoordinator:
             raise RuntimeError(
                 f"deterministic dispatcher source mismatch: missing={missing}, extra={extra}"
             )
+
+        # Incremental schema-v2 aggregates recover unchanged source from the exact
+        # recorded Git blob. Schema-v1 aggregates read their tracked module once
+        # and are migrated to the single-file format by this regeneration.
         for name, record in module_records.items():
-            path = self.workspace / str(record.get("path") or "")
-            if not path.is_file() or path.parent.resolve() != module_dir.resolve():
-                raise RuntimeError(f"deterministic dispatcher module is missing: {name}")
+            if name in module_sources:
+                continue
+            legacy_path = str(record.get("path") or "")
+            legacy_source = self.workspace / legacy_path if legacy_path else None
+            if legacy_source is not None and legacy_source.is_file():
+                module_sources[name] = legacy_source.read_text(encoding="utf-8")
+            else:
+                campaign = self._bucket_campaigns.get(name)
+                if campaign is None:
+                    raise RuntimeError(f"no bucket workspace available for aggregate source: {name}")
+                module_sources[name] = _git_blob_file(
+                    campaign.workspace, record.get("kernel_blob")
+                )
+            record.pop("path", None)
+            record["embedded"] = True
 
         bucket_by_index = {
             index: bucket.name
@@ -3665,11 +4807,16 @@ class WorkloadBucketCoordinator:
             signature_records=signatures,
             bucket_by_index=bucket_by_index,
             module_records=module_records,
+            module_sources=module_sources,
         )
+        if module_dir.exists():
+            shutil.rmtree(module_dir)
         (self.workspace / "kernel.py").write_text(dispatcher, encoding="utf-8")
         dispatch_manifest = {
-            "schema_version": 1,
+            "schema_version": AGGREGATE_DISPATCH_SCHEMA_VERSION,
             "mode": "deterministic_dispatch",
+            "source_layout": AGGREGATE_SOURCE_LAYOUT,
+            "dispatch_visibility_policy": DISPATCH_VISIBILITY_POLICY,
             "kind": workload_source.kind,
             "workload_source": workload_source.filename,
             "signature_source": DISPATCH_SIGNATURES_FILE,
@@ -3773,17 +4920,10 @@ class WorkloadBucketCoordinator:
         spec["dependencies"] = dependencies
         dispatch_path = self.workspace / AGGREGATE_DISPATCH_FILE
         if dispatch_path.is_file():
-            dispatch = json.loads(dispatch_path.read_text(encoding="utf-8"))
-            modules = dispatch.get("modules") or {}
-            source_paths = ["kernel.py", f"{AGGREGATE_KERNELS_DIR}/__init__.py"]
-            source_paths.extend(
-                str(record["path"])
-                for _, record in sorted(modules.items())
-                if isinstance(record, dict) and isinstance(record.get("path"), str)
-            )
-            solution["sources"] = [{"path": path} for path in source_paths]
+            solution["sources"] = [{"path": "kernel.py"}]
         solution["description"] = (
-            "Deterministic full-workload dispatcher over independently optimized buckets"
+            "Self-contained deterministic full-workload dispatcher over independently "
+            "optimized buckets"
         )
         solution_path.write_text(
             json.dumps(solution, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -3891,6 +5031,8 @@ class WorkloadBucketCoordinator:
                         "status": "REJECTED",
                         "minimum_iterations": INITIAL_AGGREGATION_MIN_ITERATIONS,
                         "source_kernel_blobs": source_kernel_blobs,
+                        "dispatch_schema_version": AGGREGATE_DISPATCH_SCHEMA_VERSION,
+                        "source_layout": AGGREGATE_SOURCE_LAYOUT,
                         "reason": reason,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     }
@@ -3980,6 +5122,7 @@ class WorkloadBucketCoordinator:
                             wall_timeout=(
                                 validation_timeout + AGGREGATE_QUEUE_WAIT_GRACE
                             ),
+                            gateway_kind="run",
                         )
                     except (OSError, subprocess.SubprocessError) as exc:
                         rejection = (
@@ -4050,6 +5193,8 @@ class WorkloadBucketCoordinator:
                         "status": "REJECTED",
                         "minimum_iterations": INITIAL_AGGREGATION_MIN_ITERATIONS,
                         "source_kernel_blobs": source_kernel_blobs,
+                        "dispatch_schema_version": AGGREGATE_DISPATCH_SCHEMA_VERSION,
+                        "source_layout": AGGREGATE_SOURCE_LAYOUT,
                         "reason": rejection,
                         "aggregate_latency_us": aggregate_latency,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -4126,6 +5271,8 @@ class WorkloadBucketCoordinator:
                     "minimum_iterations": INITIAL_AGGREGATION_MIN_ITERATIONS,
                     "source_kernel_blobs": source_kernel_blobs,
                     "dispatch_mode": "deterministic_dispatch",
+                    "dispatch_schema_version": AGGREGATE_DISPATCH_SCHEMA_VERSION,
+                    "source_layout": AGGREGATE_SOURCE_LAYOUT,
                     "reason": (
                         "deterministic dispatch passed full-workload correctness and improved geomean"
                     ),
@@ -4136,11 +5283,19 @@ class WorkloadBucketCoordinator:
             self._write_state(state)
             commit_paths = [
                 "kernel.py",
-                AGGREGATE_KERNELS_DIR,
                 AGGREGATE_DISPATCH_FILE,
                 str(memory_path.relative_to(self.workspace)),
                 AGGREGATION_STATE_FILE,
             ]
+            legacy_modules = subprocess.run(
+                ["git", "ls-files", "--", AGGREGATE_KERNELS_DIR],
+                cwd=str(self.workspace),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if legacy_modules or (self.workspace / AGGREGATE_KERNELS_DIR).exists():
+                commit_paths.append(AGGREGATE_KERNELS_DIR)
             if (self.workspace / "solution.json").exists():
                 commit_paths.append("solution.json")
             self._commit_main(
@@ -4200,6 +5355,9 @@ class WorkloadBucketCoordinator:
             target_util=parent.target_util,
             iter_timeout=parent.iter_timeout,
             setup_timeout=parent.setup_timeout,
+            salvage_timeout=parent.salvage_timeout,
+            framework_baseline="never",
+            framework_baseline_timeout=parent.framework_baseline_timeout,
             max_stall=parent.max_stall,
             convert_after=parent.convert_after,
             sandbox_hardware=parent.sandbox_hardware,
@@ -4212,20 +5370,231 @@ class WorkloadBucketCoordinator:
             on_improvement=on_improvement,
             on_iteration=on_iteration,
         )
-        # Native shapes buckets must use the same already-validated generic
-        # harness as the aggregate workspace.  Leaving harness creation to a
-        # coding session can accidentally select reference/test_kernel.py,
-        # which is SOL-only and requires workload.jsonl/sol-execbench.  Seed
-        # only pre-V0 workspaces; a committed bucket harness is immutable.
-        aggregate_harness = self.workspace / "test_kernel.py"
-        if (
-            workload_source.kind == "shapes"
-            and aggregate_harness.is_file()
-            and latest_version(campaign.workspace) < 0
-        ):
-            campaign.workspace.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(aggregate_harness, campaign.workspace / "test_kernel.py")
         return campaign
+
+    def _seed_bucket_baseline_from_aggregate(
+        self,
+        bucket: WorkloadBucket,
+        campaign: Campaign,
+        workload_source: WorkloadSource,
+    ) -> None:
+        """Create a bucket V0 from the already-validated aggregate baseline.
+
+        This is deliberately mechanical: no coding-agent session and no GPU
+        command are involved.  The bucket receives the aggregate's pinned
+        framework-baseline kernel (or its original V0 kernel when the campaign has none)
+        plus only its own workload files and per-workload measurements.
+        """
+        if self.aggregate_campaign.framework_baseline == "never":
+            baseline_commit, baseline_version = "", 0
+        else:
+            baseline_commit, baseline_version = resolve_framework_baseline_commit(self.workspace)
+        if latest_version(campaign.workspace) >= 0:
+            self._assert_bucket_baseline_provenance(bucket, campaign, baseline_commit)
+            return
+        aggregate_memory = read_memory(self.workspace, baseline_version)
+        if aggregate_memory is None:
+            raise RuntimeError(
+                "cannot seed bucket baseline before aggregate "
+                f"memory/v{baseline_version}.json exists"
+            )
+        aggregate_passed = _status_is(
+            (aggregate_memory.get("quality_gate") or {}).get("result"), "PASS"
+        ) or _status_is(
+            (aggregate_memory.get("correctness") or {}).get("status"), "PASS"
+        )
+        if not aggregate_passed:
+            raise RuntimeError(
+                f"cannot seed bucket baseline from a non-passing aggregate v{baseline_version}"
+            )
+
+        roots = subprocess.run(
+            ["git", "rev-list", "--max-parents=0", "HEAD"],
+            cwd=str(self.workspace),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        if len(roots) != 1:
+            raise RuntimeError("aggregate workspace must have exactly one V0 root commit")
+        aggregate_baseline_commit = baseline_commit or roots[0]
+
+        def baseline_file(name: str, *, required: bool = False) -> Optional[str]:
+            result = subprocess.run(
+                ["git", "show", f"{aggregate_baseline_commit}:{name}"],
+                cwd=str(self.workspace),
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                return result.stdout
+            if required:
+                raise RuntimeError(
+                    f"aggregate baseline commit {aggregate_baseline_commit[:8]} has no {name}"
+                )
+            return None
+
+        workspace = campaign.workspace
+        for directory in (workspace, workspace / "memory", workspace / "plans", workspace / "profiles"):
+            directory.mkdir(parents=True, exist_ok=True)
+        if not (workspace / ".git").exists():
+            subprocess.run(
+                ["git", "init"], cwd=str(workspace), check=True, stdout=subprocess.DEVNULL
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "gpu-kernel-optimizer@local"],
+                cwd=str(workspace),
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "GPU Kernel Optimizer"],
+                cwd=str(workspace),
+                check=True,
+            )
+
+        bucket_op = Path(campaign.kernel_demo).resolve().parent
+        tracked_files: set[str] = set()
+        for source in bucket_op.iterdir():
+            if not source.is_file():
+                continue
+            shutil.copy2(source, workspace / source.name)
+            tracked_files.add(source.name)
+
+        # These files define the runnable baseline and must come from the aggregate's validated
+        # framework-baseline commit (or its original V0 commit when the campaign has none),
+        # never from a later dispatcher HEAD.
+        for name in (
+            "kernel.py",
+            "solution.json",
+            "test_kernel.py",
+            "config.json",
+            ".gitignore",
+            "CLAUDE.md",
+        ):
+            content = baseline_file(name, required=name == "kernel.py")
+            if content is None and name == "test_kernel.py":
+                aggregate_harness = self.workspace / name
+                if aggregate_harness.is_file():
+                    content = aggregate_harness.read_text(encoding="utf-8")
+                else:
+                    raise RuntimeError("aggregate workspace has no immutable test_kernel.py")
+            if content is not None:
+                (workspace / name).write_text(content, encoding="utf-8")
+                tracked_files.add(name)
+
+        source_label = (
+            f"framework baseline v{baseline_version}" if baseline_version > 0 else "V0"
+        )
+        selected_ids = [workload_source.ids[index] for index in bucket.workload_indices]
+        readme = baseline_file("README.md") or "# GPU kernel optimization\n"
+        (workspace / "README.md").write_text(
+            f"# Workload bucket: {bucket.name}\n\n"
+            f"This workspace V0 is derived from aggregate {source_label} "
+            f"`{aggregate_baseline_commit[:12]}`. "
+            f"It contains workload ids {', '.join(selected_ids)} and was not re-evaluated.\n\n"
+            + readme,
+            encoding="utf-8",
+        )
+        tracked_files.add("README.md")
+        aggregate_report = baseline_file("baseline_report.md") or ""
+        (workspace / "baseline_report.md").write_text(
+            f"# Derived bucket V0 baseline — {bucket.name}\n\n"
+            f"This baseline reuses the aggregate {source_label} kernel, correctness result, and the "
+            "per-workload timings selected below. No separate baseline agent or GPU run was used.\n\n"
+            f"- Aggregate baseline: {source_label} at `{aggregate_baseline_commit}`\n"
+            f"- Workload indices: {', '.join(map(str, bucket.workload_indices))}\n"
+            f"- Workload ids: {', '.join(selected_ids)}\n\n"
+            + aggregate_report,
+            encoding="utf-8",
+        )
+        tracked_files.add("baseline_report.md")
+
+        derived_memory = _bucket_baseline_memory(
+            aggregate_memory,
+            bucket,
+            workload_source,
+            aggregate_workspace=self.workspace,
+            aggregate_baseline_commit=aggregate_baseline_commit,
+            aggregate_baseline_version=baseline_version,
+        )
+        memory_path = workspace / "memory" / "v0.json"
+        memory_path.write_text(
+            json.dumps(derived_memory, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        tracked_files.add("memory/v0.json")
+
+        campaign._link_runtime()
+        tracked_files.update(name for name in (".gitignore", "CLAUDE.md") if (workspace / name).is_file())
+        # A previously interrupted setup may have staged arbitrary files.  Keep
+        # the worktree intact, but rebuild the index so this mechanical commit
+        # contains only the deterministic V0 files listed above.
+        if git_head(workspace):
+            subprocess.run(
+                ["git", "reset"],
+                cwd=str(workspace),
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.run(["git", "read-tree", "--empty"], cwd=str(workspace), check=True)
+        subprocess.run(
+            ["git", "add", "--", *sorted(tracked_files)],
+            cwd=str(workspace),
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", f"V0: derive bucket baseline from aggregate {source_label}"],
+            cwd=str(workspace),
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        first_commit = git_head(workspace)
+        derived_memory["git_commit_hash"] = first_commit
+        memory_path.write_text(
+            json.dumps(derived_memory, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "memory/v0.json"], cwd=str(workspace), check=True)
+        subprocess.run(
+            ["git", "commit", "--amend", "--no-edit"],
+            cwd=str(workspace),
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        print(
+            f"[workload-coordinator] derived {bucket.name} V0 from aggregate {source_label} "
+            f"for {len(bucket.workload_indices)} workloads (no agent/GPU rerun)",
+            flush=True,
+        )
+
+    def _assert_bucket_baseline_provenance(
+        self, bucket: WorkloadBucket, campaign: Campaign, baseline_commit: str
+    ) -> None:
+        """Refuse to mix baselines: an already-seeded bucket must match the pinned baseline.
+
+        Continuing silently would leave the aggregate advertising a framework baseline while some
+        bucket sources still descend from the PyTorch V0 — invisible from the outside and exactly
+        the provenance confusion the pin exists to prevent. Re-seeding is not an option either: it
+        would destroy that bucket's optimization history.
+        """
+        if not baseline_commit:
+            return
+        derivation = (read_memory(campaign.workspace, 0) or {}).get("baseline_derivation") or {}
+        seeded_from = _normalize_commit_hash(
+            derivation.get("aggregate_baseline_commit") or derivation.get("aggregate_v0_commit")
+        )
+        if not seeded_from or seeded_from == baseline_commit:
+            return
+        message = (
+            f"bucket {bucket.name} was seeded from aggregate commit {seeded_from[:12]} but the "
+            f"aggregate now pins framework baseline {baseline_commit[:12]}; re-seeding would "
+            "destroy that bucket's history. Continue with --framework-baseline never to keep the "
+            "existing bucket baselines, or start a fresh --workspace."
+        )
+        if self.aggregate_campaign.optimization_mode == "production":
+            raise RuntimeError(message)
+        print(f"[workload-coordinator] WARNING: {message}", file=sys.stderr, flush=True)
 
     def _reconcile_resumed_bucket(
         self, bucket: WorkloadBucket, campaign: Campaign
@@ -4291,6 +5660,10 @@ class WorkloadBucketCoordinator:
             bucket.name: self._make_bucket_campaign(bucket, workload_source)
             for bucket in buckets
         }
+        for bucket in buckets:
+            self._seed_bucket_baseline_from_aggregate(
+                bucket, self._bucket_campaigns[bucket.name], workload_source
+            )
         # Reconciliation prompts read bucket files from the worktree, while
         # aggregation provenance is the committed HEAD.  Clean interrupted
         # tracked edits before either reconciling or launching new iterations
@@ -4629,6 +6002,7 @@ class LayerCampaign:
                 sandbox_profile=self.sandbox_profile,
                 sandbox_url=self.sandbox_url,
                 sandbox_timeout=self.sandbox_timeout,
+                reasoning_effort="high",
             )
             self._account(res, f"baseline {b['name']}")
             if read_memory(ws, 0) is None:
@@ -4964,12 +6338,24 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="Peak-utilization %% short-circuit (default stop condition).")
     ap.add_argument("--iter-timeout", type=int, default=5400, help="Per-iteration hang backstop (s).")
     ap.add_argument("--setup-timeout", type=int, default=7200, help="Baseline session timeout (s).")
+    ap.add_argument("--salvage-timeout", type=int, default=SALVAGE_TIMEOUT_S,
+                    help="Budget (s) for the post-mortem session that records an iteration killed by "
+                         "timeout or API failure (0 = write the mechanical record only).")
+    ap.add_argument("--framework-baseline", choices=FRAMEWORK_BASELINE_MODES, default="auto",
+                    help="Run one dedicated session between V0 setup and workload bucketing that "
+                         "replaces the V0 PyTorch wrapper with the first self-contained framework "
+                         "kernel, recorded as v1 (so optimization rounds start at v2) and inherited "
+                         "by every workload bucket. auto = production mode only; always = "
+                         "leaderboard too; never = legacy flow (buckets derive from the V0 kernel).")
+    ap.add_argument("--framework-baseline-timeout", type=int, default=FRAMEWORK_BASELINE_TIMEOUT_S,
+                    help="Framework baseline session timeout (s).")
     ap.add_argument("--max-stall", type=int, default=0,
                     help="Optional: stop after N consecutive no-commit iterations (0 = disabled).")
-    ap.add_argument("--convert-after", type=int, default=5,
-                    help="Leaderboard Triton only: after N consecutive stalled iterations, spend ONE session "
-                         "converting the kernel Triton->Gluon (no optimization), then optimize the Gluon "
-                         "kernel. Always disabled in production mode. 0 = disabled.")
+    ap.add_argument("--convert-after", type=int, default=DEFAULT_CONVERT_AFTER,
+                    help="Triton only: after N consecutive stalled iterations, require conversion "
+                         "to Gluon. Failed conversions retry immediately until one passes correctness "
+                         "and performance parity, then optimization continues in Gluon. Default: 3; "
+                         "0 disables conversion.")
     ap.add_argument("--arch", default="",
                     help="Override the real runtime GPU arch, e.g. sm_103 or gfx942. Default: auto-detect "
                          "via torch (get_device_capability / gcnArchName) — use this if auto-detect fails.")
@@ -4989,6 +6375,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
     if args.max_workload_buckets < 1:
         ap.error("--max-workload-buckets must be at least 1")
+    if args.convert_after < 0:
+        ap.error("--convert-after must be non-negative")
+    if args.salvage_timeout < 0:
+        ap.error("--salvage-timeout must be non-negative (0 disables the post-mortem session)")
+    if args.framework_baseline_timeout <= 0:
+        ap.error("--framework-baseline-timeout must be positive")
     if not 0.0 <= args.aggregate_min_improvement_pct < 100.0:
         ap.error("--aggregate-min-improvement-pct must be in [0, 100)")
     if args.sandbox_url and args.sandbox_profile:
@@ -5013,14 +6405,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             file=sys.stderr,
             flush=True,
         )
-    if args.optimization_mode == "production" and args.convert_after > 0:
-        print(
-            "[orchestrator] production mode disables Triton->Gluon conversion so each campaign's "
-            "framework remains an exact implementation constraint",
-            file=sys.stderr,
-            flush=True,
-        )
-
     sandbox_hardware = args.sandbox_hardware or args.platform
     if args.workspace:
         Path(args.workspace).mkdir(parents=True, exist_ok=True)
@@ -5086,7 +6470,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         workspace_suffix=workspace_suffix,
         max_iters=args.max_iters, token_budget=args.token_budget, target_util=args.target_util,
         iter_timeout=args.iter_timeout, setup_timeout=args.setup_timeout, max_stall=args.max_stall,
-        convert_after=(0 if args.optimization_mode == "production" else args.convert_after),
+        salvage_timeout=args.salvage_timeout,
+        framework_baseline=args.framework_baseline,
+        framework_baseline_timeout=args.framework_baseline_timeout,
+        convert_after=args.convert_after,
     )
     if is_bucketable_op(Path(op["op_dir"])) and not args.no_workload_bucketing:
         coordinator = WorkloadBucketCoordinator(
