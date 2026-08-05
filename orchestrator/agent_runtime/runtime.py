@@ -13,6 +13,7 @@ from .adapter import (
     BackendAdapterRegistry,
     ClaudeAdapter,
     CodexAdapter,
+    PiAdapter,
     QoderAdapter,
     codex_settings_args,
     token_usage_from_mapping,
@@ -97,6 +98,9 @@ def build_session_environment(runtime_id: str) -> dict[str, str]:
     protected_screen, protected_state = protected_gateway_identity(environment)
     environment["ATREX_PROTECTED_GATEWAY_SCREEN"] = protected_screen
     environment["ATREX_PROTECTED_GATEWAY_STATE_DIR"] = protected_state
+    if runtime_id == "pi":
+        environment["PI_SKIP_VERSION_CHECK"] = "1"
+        environment["PI_TELEMETRY"] = "0"
     if runtime_id == "claude" and environment.get("ANTHROPIC_AUTH_TOKEN"):
         environment.pop("ANTHROPIC_API_KEY", None)
     return environment
@@ -215,6 +219,16 @@ class QoderRuntime(CliAgentRuntime):
         humanize_dir: Path = DEFAULT_HUMANIZE_DIR,
     ) -> None:
         super().__init__(QoderAdapter(humanize_dir), process_runner=process_runner)
+
+
+class PiRuntime(CliAgentRuntime):
+    def __init__(
+        self,
+        *,
+        process_runner: ProcessRunner = run_bounded,
+        humanize_dir: Path = DEFAULT_HUMANIZE_DIR,
+    ) -> None:
+        super().__init__(PiAdapter(humanize_dir), process_runner=process_runner)
 
 
 class CodexRuntime(CliAgentRuntime):

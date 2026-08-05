@@ -1,4 +1,4 @@
-"""Characterize the current Claude/Qoder/Codex runtime contract before extraction."""
+"""Characterize the current Claude/Qoder/Codex/Pi runtime contract."""
 
 from __future__ import annotations
 
@@ -53,6 +53,17 @@ class AgentCommandCharacterizationTest(unittest.TestCase):
                 'model_reasoning_effort="high"',
                 "prompt",
             ],
+            "pi": [
+                "pi",
+                "--mode",
+                "json",
+                "--session-id",
+                "session-123",
+                "--approve",
+                "--thinking",
+                "high",
+                "prompt",
+            ],
         }
         with tempfile.TemporaryDirectory(prefix="runtime-command-") as temp_dir:
             with (
@@ -97,6 +108,26 @@ class AgentCommandCharacterizationTest(unittest.TestCase):
                     self.assertEqual(command[settings_index + 1], native_value)
                     self.assertNotIn("generic-fallback", command)
 
+    def test_pi_settings_select_provider_and_model(self) -> None:
+        with (
+            mock.patch.object(optimize, "HUMANIZE_DIR", Path("missing")),
+            mock.patch.dict(
+                optimize.os.environ,
+                {
+                    "ATREX_PI_SESSION_SETTINGS": json.dumps(
+                        {"provider": "anthropic", "model": "claude-opus"}
+                    )
+                },
+                clear=True,
+            ),
+        ):
+            command = optimize._session_command("pi", "prompt", "session-123")
+
+        self.assertIn("--provider", command)
+        self.assertEqual(command[command.index("--provider") + 1], "anthropic")
+        self.assertIn("--model", command)
+        self.assertEqual(command[command.index("--model") + 1], "claude-opus")
+
     def test_claude_loads_humanize_only_when_the_plugin_is_present(self) -> None:
         with tempfile.TemporaryDirectory(prefix="claude-plugin-") as temp_dir:
             humanize = Path(temp_dir)
@@ -132,6 +163,10 @@ class AgentCommandCharacterizationTest(unittest.TestCase):
             optimize._agent_auth_hint("codex"),
             'run `codex login status` and `codex exec --ephemeral "reply ok"` to diagnose',
         )
+        self.assertEqual(
+            optimize._agent_auth_hint("pi"),
+            'run `pi --list-models` and `pi -p "reply ok"` to diagnose',
+        )
 
 
 class AgentEnvironmentCharacterizationTest(unittest.TestCase):
@@ -164,6 +199,9 @@ class AgentEnvironmentCharacterizationTest(unittest.TestCase):
                     self.assertNotIn("ANTHROPIC_API_KEY", environment)
                 else:
                     self.assertEqual(environment["ANTHROPIC_API_KEY"], "api-key")
+                if backend == "pi":
+                    self.assertEqual(environment["PI_SKIP_VERSION_CHECK"], "1")
+                    self.assertEqual(environment["PI_TELEMETRY"], "0")
 
     def test_session_environment_deduplicates_the_active_python_bin(self) -> None:
         python_bin = str(Path(sys.executable).resolve().parent)
@@ -247,12 +285,19 @@ class RunSessionCharacterizationTest(unittest.TestCase):
                     env: dict | None = None,
                 ) -> tuple[str, str, int, bool]:
                     captured.update(command=command, cwd=cwd, timeout=timeout, env=env)
-                    return (
-                        '{"type":"result","usage":{"input_tokens":7,"output_tokens":2}}',
-                        "stderr",
-                        0,
-                        False,
+                    stdout = (
+                        "\n".join(
+                            [
+                                '{"type":"message_end","message":{"role":"assistant",'
+                                '"usage":{"input":7,"output":2,"cacheRead":0,'
+                                '"cacheWrite":0,"totalTokens":9}}}',
+                                '{"type":"agent_settled"}',
+                            ]
+                        )
+                        if backend == "pi"
+                        else '{"type":"result","usage":{"input_tokens":7,"output_tokens":2}}'
                     )
+                    return stdout, "stderr", 0, False
 
                 with self.subTest(backend=backend):
                     with (

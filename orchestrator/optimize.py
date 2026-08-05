@@ -4,8 +4,8 @@
 Owns the OUTER optimization loop so termination no longer depends on the model's
 in-session judgment (the old Stage-6 "is README's Stop Conditions met?" self-call).
 
-Each iteration is a **fresh coding-agent session** (`claude` by default, or `qodercli` / `codex`
-via `--agent-cli`) over the *same* git workspace. State crosses the session boundary only
+Each iteration is a **fresh coding-agent session** (`claude` by default, or `qodercli` / `codex` /
+`pi` via `--agent-cli`) over the *same* git workspace. State crosses the session boundary only
 through disk — exactly the artifacts atrex already maintains: `memory/v<N>.json`, `plans/`,
 `profiles/`, and git. HEAD is always the best kernel (a regressing iteration reverts and is
 never committed).
@@ -126,7 +126,7 @@ IMMUTABLE_BASELINE_PATHS = (
     "roofline.json", "workload.jsonl", "definition.json", "valid.py", "memory/v0.json",
 )
 TEST_RESULT_PREFIX = "[test_kernel] RESULT_JSON="
-AGENT_CLI_CHOICES = ("claude", "qodercli", "codex")
+AGENT_CLI_CHOICES = _agent_runtime.SUPPORTED_RUNTIME_IDS
 NVIDIA_FRAMEWORKS = ("Triton", "CuteDSL", "Cuda")
 AMD_FRAMEWORKS = ("Triton", "FlyDSL")
 DEFAULT_FRAMEWORKS = ("Triton",)
@@ -518,6 +518,11 @@ def _codex_settings_args(raw: str) -> list[str]:
     return _agent_runtime.codex_settings_args(raw)
 
 
+def _pi_settings_args(raw: str) -> list[str]:
+    """Compatibility route to the extracted Pi settings parser."""
+    return _agent_runtime.pi_settings_args(raw)
+
+
 def _session_command(
     agent_cli: str,
     prompt: str,
@@ -891,10 +896,22 @@ def memory_record_is_empty(memory: Optional[dict]) -> bool:
 def session_transcript_path(agent_cli: str, session_id: str) -> Optional[Path]:
     """Locate a finished session's transcript so a post-mortem session can read what it tried.
 
-    Resolved by globbing for the session id rather than reconstructing the CLI's project-slug
+    Resolved by globbing for the session id rather than reconstructing each CLI's project-slug
     encoding, which is an internal convention. Codex sessions are ephemeral and leave none.
     """
     if not session_id:
+        return None
+    if agent_cli == "pi":
+        configured = os.environ.get("PI_CODING_AGENT_SESSION_DIR")
+        if configured:
+            session_root = Path(configured).expanduser()
+        else:
+            agent_root = Path(
+                os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent")
+            ).expanduser()
+            session_root = agent_root / "sessions"
+        for candidate in sorted(session_root.glob(f"**/*_{session_id}.jsonl")):
+            return candidate
         return None
     roots = {"claude": ".claude", "qodercli": ".qoder"}
     root = roots.get(agent_cli)
@@ -1537,8 +1554,8 @@ def hardware_directive(platform: str, arch: str) -> str:
 
 
 
-def _install_codex_humanize_skills(skills_dir: Path) -> None:
-    """Install a workspace-local, hydrated Humanize subset for Codex.
+def _install_agent_humanize_skill(skills_dir: Path) -> None:
+    """Install a workspace-local, hydrated Humanize subset for Codex and Pi.
 
     Humanize's upstream Codex installer also changes user-global hooks and configuration. The
     orchestrator must not mutate global state, so this mirrors only the skill/runtime hydration
@@ -1585,11 +1602,12 @@ def _install_codex_humanize_skills(skills_dir: Path) -> None:
 
 
 def _agent_runtime_directive(agent_cli: str) -> str:
-    if agent_cli == "codex":
+    if agent_cli in {"codex", "pi"}:
+        syntax = "Codex's `$skill-name` syntax" if agent_cli == "codex" else "Pi's `/skill:name` syntax"
         return (
-            "- `.agents/skills/` — repository-local Codex skills, including "
+            f"- `.agents/skills/` — repository-local {agent_cli} skills, including "
             "`gpu-kernel-baseline`, `ncu-report-skill`, `KernelWiki`, and "
-            "`humanize-gen-plan`. Invoke a named skill with Codex's `$skill-name` syntax."
+            f"`humanize-gen-plan`. Invoke a named skill with {syntax}."
         )
     return (
         "- `.claude/skills/ncu-report-skill/` — NVIDIA profiling skill.\n"
@@ -1603,6 +1621,12 @@ def _baseline_driver_directive(agent_cli: str) -> str:
             "Use the `$gpu-kernel-baseline` skill and complete its baseline workflow in this "
             "session. If Codex collaboration/sub-agent tools are available, delegate that bounded "
             "implementation task and wait for it; otherwise execute the skill directly yourself"
+        )
+    if agent_cli == "pi":
+        return (
+            "Use the `/skill:gpu-kernel-baseline` skill and complete its workflow directly in "
+            "this Pi session. Pi has no built-in subagent requirement here; do not launch a "
+            "nested coding-agent process"
         )
     if agent_cli == "qodercli":
         return (
@@ -1627,6 +1651,12 @@ def _plan_generator_directive(agent_cli: str, version: int) -> str:
             "The skill is repository-local under `.agents/skills/`; do not look for a slash "
             "command or Claude plugin."
         )
+    if agent_cli == "pi":
+        return (
+            f"Invoke `/skill:humanize-gen-plan` in this Pi session with `{draft}` as input and "
+            f"`{plan}` as output. Use direct/no-discussion mode and wait for the plan file before "
+            "continuing."
+        )
     if agent_cli == "qodercli":
         return (
             f"Read `{draft}` and generate `{plan}` yourself in this Qoder session. Do not invoke "
@@ -1649,11 +1679,11 @@ def link_runtime(workspace: Path, atrex_bench_root: Optional[Path] = None) -> No
     so symlink them in (absolute targets, so the workspace can live anywhere). Idempotent.
 
     Also installs the same skills and agent definitions into ``.claude/`` and ``.qoder/``, and
-    repository-local Codex skills into ``.agents/skills/``.
+    repository-local Codex/Pi skills into ``.agents/skills/``.
 
     Claude loads Humanize via ``--plugin-dir`` after the orchestrator provisions ``jq``. Qoder
-    owns plan generation directly and does not load Humanize. Codex receives a repository-scoped,
-    hydrated Humanize skill without changing global user state.
+    owns plan generation directly and does not load Humanize. Codex and Pi receive a
+    repository-scoped, hydrated Humanize skill without changing global user state.
     """
     for sub in ("tools", "reference", "skills", "reference-projects", "gpu-wiki"):
         src, dst = REPO_ROOT / sub, workspace / sub
@@ -1698,25 +1728,25 @@ def link_runtime(workspace: Path, atrex_bench_root: Optional[Path] = None) -> No
         if agents_src.exists() and not runtime_agents_dir.exists():
             os.symlink(agents_src, runtime_agents_dir)
 
-    # Codex discovers repository-scoped skills from .agents/skills. Keep these local to the
-    # campaign so choosing --agent-cli codex neither requires nor mutates the user's global
-    # CODEX_HOME. The project-native optimization skills can remain symlinks; Humanize needs a
+    # Codex and Pi discover repository-scoped skills from .agents/skills. Keep these local to
+    # the campaign so selecting either runtime neither requires nor mutates user-global state.
+    # The project-native optimization skills can remain symlinks; Humanize needs a
     # hydrated SKILL.md, so it is materialized by the helper above.
-    codex_skills_dir = workspace / ".agents" / "skills"
-    codex_skills_dir.mkdir(parents=True, exist_ok=True)
+    agent_skills_dir = workspace / ".agents" / "skills"
+    agent_skills_dir.mkdir(parents=True, exist_ok=True)
     project_skills = REPO_ROOT / "skills"
     if project_skills.is_dir():
         for source in project_skills.iterdir():
             if not (source / "SKILL.md").is_file():
                 continue
-            destination = codex_skills_dir / source.name
+            destination = agent_skills_dir / source.name
             if not destination.exists():
                 os.symlink(source, destination)
     for source, name in ((ncu_src, "ncu-report-skill"), (kw_src, "KernelWiki")):
-        destination = codex_skills_dir / name
+        destination = agent_skills_dir / name
         if source.exists() and not destination.exists():
             os.symlink(source, destination)
-    _install_codex_humanize_skills(codex_skills_dir)
+    _install_agent_humanize_skill(agent_skills_dir)
     gi = workspace / ".gitignore"
     existing = gi.read_text(encoding="utf-8") if gi.exists() else ""
     add = ""
@@ -1764,7 +1794,7 @@ class Campaign:
     sandbox_url: str = ""          # explicit endpoint, e.g. http://127.0.0.1:8000
     sandbox_timeout: int = DEFAULT_SANDBOX_TIMEOUT
     atrex_bench_root: str = ""      # native shapes route: canonical checkout owning run_eval.py
-    agent_cli: str = "claude"       # clean-session coding backend: claude, qodercli, or codex
+    agent_cli: str = "claude"       # clean-session backend: claude, qodercli, codex, or pi
     optimization_mode: str = "leaderboard"  # permissive contest flow or strict production gate
     framework_baseline: str = "auto"        # auto = production only; always | never override it
     framework_baseline_timeout: int = FRAMEWORK_BASELINE_TIMEOUT_S
@@ -5744,7 +5774,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     ap.add_argument(
         "--agent-cli", choices=AGENT_CLI_CHOICES, default="claude",
-        help="Coding CLI used for clean optimization sessions: claude, qodercli, or codex "
+        help="Coding CLI used for clean optimization sessions: claude, qodercli, codex, or pi "
              "(default: claude).",
     )
     ap.add_argument(
@@ -5850,6 +5880,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         try:
             _codex_settings_args(codex_settings)
+        except ValueError as exc:
+            ap.error(str(exc))
+    if args.agent_cli == "pi":
+        pi_settings = (
+            os.environ.get("ATREX_PI_SESSION_SETTINGS")
+            or os.environ.get("ATREX_SESSION_SETTINGS")
+            or ""
+        )
+        try:
+            _pi_settings_args(pi_settings)
         except ValueError as exc:
             ap.error(str(exc))
     if args.agent_cli == "qodercli" and args.token_budget > 0:

@@ -15,7 +15,7 @@ from orchestrator.agent_runtime import (
 
 class AgentRuntimeInterfaceTest(unittest.TestCase):
     def test_factory_builds_each_supported_runtime(self) -> None:
-        for runtime_id in ("claude", "qodercli", "codex"):
+        for runtime_id in ("claude", "qodercli", "codex", "pi"):
             with self.subTest(runtime_id=runtime_id):
                 self.assertEqual(build_agent_runtime(runtime_id).id, runtime_id)
 

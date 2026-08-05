@@ -30,13 +30,16 @@ def _counter(usage: Mapping[str, object], *names: str) -> int | None:
 def token_usage_from_mapping(usage: object) -> TokenUsage:
     if not isinstance(usage, Mapping):
         return TokenUsage.unavailable()
-    input_tokens = _counter(usage, "input_tokens", "inputTokens")
-    output_tokens = _counter(usage, "output_tokens", "outputTokens")
+    input_tokens = _counter(usage, "input_tokens", "inputTokens", "input")
+    output_tokens = _counter(usage, "output_tokens", "outputTokens", "output")
     cache_read_tokens = _counter(
-        usage, "cache_read_input_tokens", "cacheReadInputTokens"
+        usage, "cache_read_input_tokens", "cacheReadInputTokens", "cacheRead"
     )
     cache_write_tokens = _counter(
-        usage, "cache_creation_input_tokens", "cacheCreationInputTokens"
+        usage,
+        "cache_creation_input_tokens",
+        "cacheCreationInputTokens",
+        "cacheWrite",
     )
     official_total = _counter(usage, "total_tokens", "totalTokens")
     components = (
@@ -90,6 +93,33 @@ def toml_config_value(value: object) -> str:
     if isinstance(value, (str, int, float, list)):
         return json.dumps(value, ensure_ascii=False)
     raise ValueError(f"unsupported Codex config value type: {type(value).__name__}")
+
+
+def pi_settings_args(raw: str) -> list[str]:
+    if not raw:
+        return []
+    try:
+        settings = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "ATREX_PI_SESSION_SETTINGS must be a JSON object"
+        ) from exc
+    if not isinstance(settings, dict):
+        raise ValueError("ATREX_PI_SESSION_SETTINGS must be a JSON object")
+    unknown = set(settings) - {"provider", "model"}
+    if unknown:
+        raise ValueError(
+            "unsupported Pi session setting(s): " + ", ".join(sorted(unknown))
+        )
+    arguments: list[str] = []
+    for key in ("provider", "model"):
+        value = settings.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Pi {key} setting must be a non-empty string")
+        arguments += [f"--{key}", value.strip()]
+    return arguments
 
 
 def codex_settings_args(raw: str) -> list[str]:
@@ -182,6 +212,14 @@ def _phase_marker_receipts(event: Mapping[str, object]):
                         roots.append(item.get("content"))
     elif event_type == "tool_result" and not event.get("is_error", False):
         roots.append(event.get("content"))
+    elif event_type == "message_end":
+        message = event.get("message")
+        if (
+            isinstance(message, Mapping)
+            and message.get("role") == "toolResult"
+            and not message.get("isError", False)
+        ):
+            roots.append(message.get("content"))
     elif event_type == "item.completed":
         item = event.get("item")
         if (
@@ -383,6 +421,107 @@ class QoderAdapter(ClaudeLikeAdapter):
         return 'run `qodercli status` and `qodercli --print "test"` to diagnose'
 
 
+class PiAdapter(AgentBackendAdapter):
+    id = "pi"
+    settings_variable = "ATREX_PI_SESSION_SETTINGS"
+    capabilities = AgentRuntimeCapabilities(
+        terminal_usage=True,
+        usage_delta=True,
+        phase_marker_receipt=True,
+    )
+
+    def __init__(self, humanize_dir: Path) -> None:
+        del humanize_dir
+
+    def build_command(
+        self,
+        prompt: str,
+        session_id: str,
+        reasoning_effort: str,
+        settings: str,
+    ) -> list[str]:
+        command = [
+            "pi",
+            "--mode",
+            "json",
+            "--session-id",
+            session_id,
+            "--approve",
+            "--thinking",
+            reasoning_effort,
+        ]
+        command += pi_settings_args(settings)
+        command.append(prompt)
+        return command
+
+    def normalize_stream(
+        self, stdout: str
+    ) -> tuple[tuple[NormalizedAgentEvent, ...], TokenUsage]:
+        normalized: list[NormalizedAgentEvent] = []
+        deltas: list[TokenUsage] = []
+        settled = False
+        for event in _json_events(stdout):
+            if event.get("type") == "message_end":
+                message = event.get("message")
+                if isinstance(message, Mapping) and message.get("role") in {
+                    "assistant",
+                    "toolResult",
+                }:
+                    usage = token_usage_from_mapping(message.get("usage"))
+                    if usage.total_tokens is not None:
+                        deltas.append(usage)
+                        normalized.append(
+                            NormalizedAgentEvent(
+                                sequence=len(normalized),
+                                kind="usage_delta",
+                                usage=usage,
+                            )
+                        )
+                for action, phase, marker_id in _phase_marker_receipts(event):
+                    normalized.append(
+                        NormalizedAgentEvent(
+                            sequence=len(normalized),
+                            kind="phase_marker",
+                            phase=phase,
+                            action=action,
+                            marker_id=marker_id,
+                        )
+                    )
+            elif event.get("type") == "compaction_end":
+                result = event.get("result")
+                usage = token_usage_from_mapping(
+                    result.get("usage") if isinstance(result, Mapping) else None
+                )
+                if usage.total_tokens is not None:
+                    deltas.append(usage)
+                    normalized.append(
+                        NormalizedAgentEvent(
+                            sequence=len(normalized),
+                            kind="usage_delta",
+                            usage=usage,
+                        )
+                    )
+            elif event.get("type") == "agent_settled":
+                settled = True
+
+        terminal = sum_token_usages(deltas)
+        if terminal.total_tokens is not None:
+            if not settled:
+                terminal = replace(terminal, measurement="partial")
+            else:
+                normalized.append(
+                    NormalizedAgentEvent(
+                        sequence=len(normalized),
+                        kind="terminal_usage",
+                        usage=terminal,
+                    )
+                )
+        return tuple(normalized), terminal
+
+    def auth_hint(self) -> str:
+        return 'run `pi --list-models` and `pi -p "reply ok"` to diagnose'
+
+
 class CodexAdapter(AgentBackendAdapter):
     id = "codex"
     settings_variable = "ATREX_CODEX_SESSION_SETTINGS"
@@ -498,3 +637,4 @@ DEFAULT_BACKEND_REGISTRY = BackendAdapterRegistry()
 DEFAULT_BACKEND_REGISTRY.register("claude", ClaudeAdapter)
 DEFAULT_BACKEND_REGISTRY.register("qodercli", QoderAdapter)
 DEFAULT_BACKEND_REGISTRY.register("codex", CodexAdapter)
+DEFAULT_BACKEND_REGISTRY.register("pi", PiAdapter)

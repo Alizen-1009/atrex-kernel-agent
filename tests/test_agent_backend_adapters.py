@@ -6,6 +6,7 @@ from pathlib import Path
 from orchestrator.agent_runtime import (
     ClaudeAdapter,
     CodexAdapter,
+    PiAdapter,
     QoderAdapter,
     TokenUsage,
     subtract_token_usage,
@@ -86,6 +87,30 @@ class BackendFixtureTest(unittest.TestCase):
         self.assertEqual([event.kind for event in events].count("usage_delta"), 2)
         self.assertEqual([event.kind for event in events].count("phase_marker"), 2)
         self.assertEqual(terminal.total_tokens, 15)
+
+    def test_pi_fixture_yields_deltas_receipts_and_derived_terminal_usage(self) -> None:
+        adapter = PiAdapter(Path("missing"))
+        events, terminal = adapter.normalize_stream(
+            (FIXTURES / "pi_usage.jsonl").read_text()
+        )
+
+        self.assertEqual(
+            [event.kind for event in events],
+            [
+                "usage_delta",
+                "phase_marker",
+                "usage_delta",
+                "phase_marker",
+                "usage_delta",
+                "terminal_usage",
+            ],
+        )
+        self.assertEqual(events[1].phase, "research")
+        self.assertEqual(terminal.input_tokens, 12)
+        self.assertEqual(terminal.output_tokens, 10)
+        self.assertEqual(terminal.cache_read_tokens, 204)
+        self.assertEqual(terminal.cache_write_tokens, 100)
+        self.assertEqual(terminal.total_tokens, 326)
 
     def test_codex_fixture_exposes_terminal_only_capability(self) -> None:
         adapter = CodexAdapter(Path("missing"))

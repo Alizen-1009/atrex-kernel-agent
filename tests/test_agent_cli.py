@@ -10,8 +10,9 @@ from orchestrator import optimize
 
 
 class AgentCliTest(unittest.TestCase):
-    def test_codex_is_a_supported_backend(self) -> None:
+    def test_codex_and_pi_are_supported_backends(self) -> None:
         self.assertIn("codex", optimize.AGENT_CLI_CHOICES)
+        self.assertIn("pi", optimize.AGENT_CLI_CHOICES)
 
     def test_codex_command_is_fresh_json_and_noninteractive(self) -> None:
         with mock.patch.dict(
@@ -29,6 +30,19 @@ class AgentCliTest(unittest.TestCase):
         self.assertNotIn("ignored-session-id", cmd)
         self.assertIn('model_reasoning_effort="max"', cmd)
         self.assertNotIn("--plugin-dir", cmd)
+
+    def test_pi_command_is_fresh_json_and_uses_repository_trust(self) -> None:
+        with mock.patch.dict(optimize.os.environ, {}, clear=True):
+            command = optimize._session_command(
+                "pi", "do one iteration", "session-123", reasoning_effort="high"
+            )
+
+        self.assertEqual(command[:3], ["pi", "--mode", "json"])
+        self.assertIn("--session-id", command)
+        self.assertEqual(command[command.index("--session-id") + 1], "session-123")
+        self.assertIn("--approve", command)
+        self.assertEqual(command[command.index("--thinking") + 1], "high")
+        self.assertEqual(command[-1], "do one iteration")
 
     def test_codex_provider_settings_become_repeatable_config_flags(self) -> None:
         settings = json.dumps(
@@ -64,6 +78,12 @@ class AgentCliTest(unittest.TestCase):
             ["-c", 'model="custom"', "-c", 'model_reasoning_effort="high"'],
         )
 
+    def test_pi_settings_fail_closed_on_unknown_or_secret_bearing_flags(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported Pi session setting"):
+            optimize._pi_settings_args('{"api-key":"must-not-enter-argv"}')
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            optimize._pi_settings_args('{"model":""}')
+
     def test_codex_settings_fail_closed_on_ambiguous_input(self) -> None:
         with self.assertRaisesRegex(ValueError, "must be a JSON object"):
             optimize._codex_settings_args("model=gpt-5")
@@ -71,6 +91,18 @@ class AgentCliTest(unittest.TestCase):
             optimize._codex_settings_args('["missing-equals"]')
         with self.assertRaisesRegex(ValueError, "must be strings"):
             optimize._codex_settings_args('{"nested": {"unsupported": true}}')
+
+    def test_pi_message_usage_drives_token_budget(self) -> None:
+        stdout = "\n".join(
+            [
+                '{"type":"message_end","message":{"role":"assistant",'
+                '"usage":{"input":7,"output":2,"cacheRead":3,'
+                '"cacheWrite":4,"totalTokens":16}}}',
+                '{"type":"agent_settled"}',
+            ]
+        )
+
+        self.assertEqual(optimize._tokens_from_stream(stdout), 16)
 
     def test_codex_turn_completed_usage_drives_token_budget(self) -> None:
         stdout = "\n".join(
@@ -135,6 +167,20 @@ class AgentCliTest(unittest.TestCase):
         self.assertEqual(env["ATREX_SANDBOX_TIMEOUT"], "456")
         self.assertEqual(result.tokens, 9)
 
+    def test_pi_transcript_is_located_in_configured_session_directory(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pi-sessions-") as temp_dir:
+            session = Path(temp_dir) / "project" / "timestamp_session-123.jsonl"
+            session.parent.mkdir()
+            session.write_text("{}\n", encoding="utf-8")
+            with mock.patch.dict(
+                optimize.os.environ,
+                {"PI_CODING_AGENT_SESSION_DIR": temp_dir},
+                clear=False,
+            ):
+                observed = optimize.session_transcript_path("pi", "session-123")
+
+        self.assertEqual(observed, session)
+
     def test_link_runtime_installs_repository_scoped_codex_skills(self) -> None:
         if not (optimize.HUMANIZE_DIR / "skills" / "humanize-gen-plan" / "SKILL.md").is_file():
             self.skipTest("Humanize submodule is not initialized")
@@ -183,13 +229,21 @@ class AgentCliTest(unittest.TestCase):
         self.assertEqual(campaign.call_args.kwargs["agent_cli"], "codex")
         campaign_instance.run.assert_called_once_with()
 
-    def test_codex_prompt_directions_use_native_skill_mentions(self) -> None:
+    def test_codex_and_pi_prompt_directions_use_native_skill_mentions(self) -> None:
         self.assertIn("$gpu-kernel-baseline", optimize._baseline_driver_directive("codex"))
         plan = optimize._plan_generator_directive("codex", 3)
         self.assertIn("$humanize-gen-plan", plan)
         self.assertIn("plans/v3_draft.md", plan)
         self.assertIn("plans/v3_plan.md", plan)
         self.assertIn("/humanize:gen-plan", optimize._plan_generator_directive("claude", 3))
+        self.assertIn(
+            "/skill:gpu-kernel-baseline",
+            optimize._baseline_driver_directive("pi"),
+        )
+        self.assertIn(
+            "/skill:humanize-gen-plan",
+            optimize._plan_generator_directive("pi", 3),
+        )
 
     def test_codex_rendered_prompts_have_no_runtime_placeholders(self) -> None:
         setup = optimize._render(
