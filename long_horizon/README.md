@@ -23,9 +23,9 @@ Run `python -m long_horizon --help` for the exact current-main CLI plus four lon
 Only the optimization-round mechanism changes. Each main iteration becomes one long coding-agent
 episode in an isolated Git worktree. The episode uses the current main iteration playbook but may run
 many related profile/research/edit/validate/benchmark cycles and private checkpoint commits before
-publishing `candidate_ready`, `pivot`, or `blocked`. Claude can resume the same session to repair an
-incomplete handoff; Qoder and Codex run a single long invocation because current main does not expose
-a persistent resume seam for them.
+publishing `candidate_ready`, `pivot`, or `blocked`. Claude and Codex can resume the same session to
+repair an incomplete handoff; Qoder and Pi run a single long invocation because the long-horizon
+adapter does not expose a persistent resume seam for them.
 
 The incumbent worktree is untouched during exploration. A candidate is promoted only after an exact
 same-allocation ABBA schedule passes correctness and beats the incumbent; promotion is a single squash

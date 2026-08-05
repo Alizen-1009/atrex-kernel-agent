@@ -1,0 +1,272 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+import uuid
+from collections.abc import Mapping
+from dataclasses import replace
+from pathlib import Path
+
+from .adapter import (
+    DEFAULT_BACKEND_REGISTRY,
+    BackendAdapterRegistry,
+    ClaudeAdapter,
+    CodexAdapter,
+    PiAdapter,
+    QoderAdapter,
+    codex_settings_args,
+    token_usage_from_mapping,
+    token_usage_from_model_usage,
+    toml_config_value,
+)
+from .model import (
+    AgentRunRequest,
+    AgentRunResult,
+    AgentRuntime,
+    TokenUsage,
+    sum_token_usages,
+)
+from .process import ProcessRunner, protected_gateway_identity, run_bounded
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SESSION_SHELL_GUARD = REPO_ROOT / "tools" / "session_shell_guard.sh"
+DEFAULT_HUMANIZE_DIR = REPO_ROOT / "3rdparty" / "humanize"
+PYPI_MIRROR = "https://pypi.tuna.tsinghua.edu.cn/simple"
+SUPPORTED_RUNTIME_IDS = DEFAULT_BACKEND_REGISTRY.ids
+REASONING_EFFORTS = frozenset({"low", "medium", "high", "max"})
+
+
+def terminal_usage_from_stream(stdout: str) -> TokenUsage:
+    """Parse the existing cross-backend terminal contract without event attribution."""
+    terminal = TokenUsage.unavailable()
+    deltas: list[TokenUsage] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, Mapping):
+            continue
+        if event.get("type") in {"result", "turn.completed"}:
+            parsed = token_usage_from_mapping(event.get("usage"))
+            if parsed.total_tokens is None:
+                parsed = token_usage_from_model_usage(event.get("modelUsage"))
+            if parsed.total_tokens is not None:
+                terminal = parsed
+            continue
+        usage = event.get("usage")
+        message = event.get("message")
+        if usage is None and isinstance(message, Mapping):
+            usage = message.get("usage")
+        parsed = token_usage_from_mapping(usage)
+        if parsed.total_tokens is not None:
+            deltas.append(parsed)
+    if terminal.total_tokens is not None:
+        return terminal
+    fallback = sum_token_usages(deltas)
+    return (
+        replace(fallback, measurement="partial")
+        if fallback.total_tokens is not None
+        else fallback
+    )
+
+
+def token_usage_from_stream(stdout: str) -> int:
+    """Preserve the terminal-token compatibility contract for legacy callers."""
+    return terminal_usage_from_stream(stdout).total_tokens or 0
+
+
+def build_session_environment(runtime_id: str) -> dict[str, str]:
+    """Build the current guarded environment for one coding-agent session."""
+    environment = os.environ.copy()
+    python_bin = str(Path(sys.executable).resolve().parent)
+    path_parts = [
+        part
+        for part in environment.get("PATH", "").split(os.pathsep)
+        if part and part != python_bin
+    ]
+    environment["PATH"] = os.pathsep.join([python_bin, *path_parts])
+    environment["PIP_ONLY_BINARY"] = ":all:"
+    environment["PIP_INDEX_URL"] = PYPI_MIRROR
+    environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    environment["BASH_ENV"] = str(SESSION_SHELL_GUARD)
+    protected_screen, protected_state = protected_gateway_identity(environment)
+    environment["ATREX_PROTECTED_GATEWAY_SCREEN"] = protected_screen
+    environment["ATREX_PROTECTED_GATEWAY_STATE_DIR"] = protected_state
+    if runtime_id == "pi":
+        environment["PI_SKIP_VERSION_CHECK"] = "1"
+        environment["PI_TELEMETRY"] = "0"
+    if runtime_id == "claude" and environment.get("ANTHROPIC_AUTH_TOKEN"):
+        environment.pop("ANTHROPIC_API_KEY", None)
+    return environment
+
+
+class CliAgentRuntime:
+    def __init__(
+        self,
+        adapter,
+        *,
+        process_runner: ProcessRunner = run_bounded,
+    ) -> None:
+        self._adapter = adapter
+        self._process_runner = process_runner
+
+    @property
+    def id(self) -> str:
+        return self._adapter.id
+
+    def build_command(
+        self, prompt: str, session_id: str, reasoning_effort: str
+    ) -> list[str]:
+        return self._adapter.build_command(
+            prompt,
+            session_id,
+            reasoning_effort,
+            self._session_settings(),
+        )
+
+    def _session_settings(self) -> str:
+        return os.environ.get(self._adapter.settings_variable) or os.environ.get(
+            "ATREX_SESSION_SETTINGS", ""
+        )
+
+    def run(self, request: AgentRunRequest) -> AgentRunResult:
+        if request.reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError(
+                f"unsupported reasoning effort: {request.reasoning_effort!r}"
+            )
+        session_id = request.session_id or str(uuid.uuid4())
+        command = self.build_command(
+            request.prompt, session_id, request.reasoning_effort
+        )
+        environment = build_session_environment(self.id)
+        environment["IS_SANDBOX"] = "1"
+        if request.sandbox_hardware:
+            environment["ATREX_SANDBOX_GPU"] = request.sandbox_hardware
+        if request.sandbox_url:
+            environment["ATREX_SANDBOX_URL"] = request.sandbox_url
+            environment.pop("ATREX_SANDBOX_PROFILE", None)
+        elif request.sandbox_profile:
+            environment["ATREX_SANDBOX_PROFILE"] = request.sandbox_profile
+            environment.pop("ATREX_SANDBOX_URL", None)
+        environment["ATREX_SANDBOX_TIMEOUT"] = str(request.sandbox_timeout_s)
+        if request.extra_environment:
+            environment.update(
+                {
+                    str(key): str(value)
+                    for key, value in request.extra_environment.items()
+                }
+            )
+        stdout, stderr, exit_status, timed_out = self._process_runner(
+            command,
+            cwd=request.workspace,
+            timeout=request.timeout_s,
+            env=environment,
+        )
+        observation_errors: tuple[str, ...] = ()
+        try:
+            events, terminal_usage = self._adapter.normalize_stream(stdout)
+        except Exception as exc:
+            # Observation parsing must not turn a completed Agent run into a failure,
+            # and the existing terminal token budget must remain available.
+            events = ()
+            terminal_usage = terminal_usage_from_stream(stdout)
+            observation_errors = (
+                f"stream_normalization_failed:{type(exc).__name__}",
+            )
+        capabilities = replace(
+            self._adapter.capabilities,
+            usage_delta_observed=any(
+                event.kind == "usage_delta" for event in events
+            ),
+        )
+        return AgentRunResult(
+            runtime_id=self.id,
+            exit_status=exit_status,
+            timed_out=timed_out,
+            terminal_usage=terminal_usage,
+            events=events,
+            capabilities=capabilities,
+            observation_errors=observation_errors,
+            stdout_tail=stdout[-2000:],
+            stderr_tail=stderr[-2000:],
+            session_id=session_id,
+        )
+
+
+class ClaudeRuntime(CliAgentRuntime):
+    def __init__(
+        self,
+        *,
+        process_runner: ProcessRunner = run_bounded,
+        humanize_dir: Path = DEFAULT_HUMANIZE_DIR,
+    ) -> None:
+        super().__init__(
+            ClaudeAdapter(humanize_dir), process_runner=process_runner
+        )
+
+
+class QoderRuntime(CliAgentRuntime):
+    def __init__(
+        self,
+        *,
+        process_runner: ProcessRunner = run_bounded,
+        humanize_dir: Path = DEFAULT_HUMANIZE_DIR,
+    ) -> None:
+        super().__init__(QoderAdapter(humanize_dir), process_runner=process_runner)
+
+
+class PiRuntime(CliAgentRuntime):
+    def __init__(
+        self,
+        *,
+        process_runner: ProcessRunner = run_bounded,
+        humanize_dir: Path = DEFAULT_HUMANIZE_DIR,
+    ) -> None:
+        super().__init__(PiAdapter(humanize_dir), process_runner=process_runner)
+
+
+class CodexRuntime(CliAgentRuntime):
+    def __init__(
+        self,
+        *,
+        process_runner: ProcessRunner = run_bounded,
+        humanize_dir: Path = DEFAULT_HUMANIZE_DIR,
+    ) -> None:
+        super().__init__(CodexAdapter(humanize_dir), process_runner=process_runner)
+
+
+def build_agent_runtime(
+    runtime_id: str,
+    *,
+    process_runner: ProcessRunner = run_bounded,
+    humanize_dir: Path = DEFAULT_HUMANIZE_DIR,
+    registry: BackendAdapterRegistry = DEFAULT_BACKEND_REGISTRY,
+) -> AgentRuntime:
+    adapter = registry.create(runtime_id, humanize_dir)
+    return CliAgentRuntime(adapter, process_runner=process_runner)
+
+
+def build_session_command(
+    runtime_id: str,
+    prompt: str,
+    session_id: str,
+    reasoning_effort: str = "max",
+    *,
+    humanize_dir: Path = DEFAULT_HUMANIZE_DIR,
+) -> list[str]:
+    if reasoning_effort not in REASONING_EFFORTS:
+        raise ValueError(f"unsupported reasoning effort: {reasoning_effort!r}")
+    runtime = build_agent_runtime(runtime_id, humanize_dir=humanize_dir)
+    assert isinstance(runtime, CliAgentRuntime)
+    return runtime.build_command(prompt, session_id, reasoning_effort)
+
+
+def auth_hint(runtime_id: str) -> str:
+    adapter = DEFAULT_BACKEND_REGISTRY.create(runtime_id, DEFAULT_HUMANIZE_DIR)
+    return adapter.auth_hint()
