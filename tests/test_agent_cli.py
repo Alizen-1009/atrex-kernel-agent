@@ -166,6 +166,8 @@ class AgentCliTest(unittest.TestCase):
         self.assertEqual(env["ATREX_SANDBOX_URL"], "https://gateway.example.test")
         self.assertEqual(env["ATREX_SANDBOX_TIMEOUT"], "456")
         self.assertEqual(result.tokens, 9)
+        self.assertEqual(result.terminal_usage.total_tokens, 9)
+        self.assertEqual([event.kind for event in result.events], ["terminal_usage"])
 
     def test_pi_transcript_is_located_in_configured_session_directory(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pi-sessions-") as temp_dir:

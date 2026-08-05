@@ -59,6 +59,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
@@ -1543,7 +1544,7 @@ def _run_typed_gateway(
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not args.hardware:
         raise SystemExit("sandbox: --hardware or ATREX_SANDBOX_GPU is required")
@@ -1862,6 +1863,70 @@ def main(argv: list[str] | None = None) -> int:
     if isinstance(remote_rc, int):
         return remote_rc
     return 0 if job.get("status") == "succeeded" else (proc.returncode or 1)
+
+
+def _sandbox_telemetry_category(arguments: list[str]) -> str:
+    names = {Path(value).name for value in arguments}
+    if names & {"profile_nvidia.sh", "profile_kernel.sh"}:
+        return "profile"
+    if "test_kernel.py" in names:
+        return "correctness" if "--multi-seed" in arguments else "benchmark"
+    return "dev"
+
+
+def _append_sandbox_telemetry(event: str, **fields: object) -> None:
+    trace = os.environ.get("ATREX_TELEMETRY_TRACE")
+    if not trace:
+        return
+    payload = {
+        "schema_version": "atrex_iteration_event_v1",
+        "campaign_id": os.environ.get("ATREX_TELEMETRY_CAMPAIGN_ID", "campaign"),
+        "iteration_id": os.environ.get("ATREX_TELEMETRY_ITERATION_ID", "unknown"),
+        "attempt_id": os.environ.get("ATREX_TELEMETRY_ATTEMPT_ID", "attempt"),
+        "event": event,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "monotonic_seconds": time.monotonic(),
+        "source": "sandbox",
+        "measurement": "exact",
+        **fields,
+    }
+    path = Path(trace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(argv if argv is not None else sys.argv[1:])
+    operation_id = f"sandbox-{os.getpid()}-{time.monotonic_ns()}"
+    category = _sandbox_telemetry_category(arguments)
+    started = time.monotonic()
+    _append_sandbox_telemetry(
+        "sandbox_operation_started",
+        operation_id=operation_id,
+        category=category,
+    )
+    try:
+        returncode = _main(argv)
+    except BaseException as exc:
+        _append_sandbox_telemetry(
+            "sandbox_operation_completed",
+            operation_id=operation_id,
+            category=category,
+            duration_seconds=round(time.monotonic() - started, 6),
+            status="failed",
+            failure_type=type(exc).__name__,
+        )
+        raise
+    _append_sandbox_telemetry(
+        "sandbox_operation_completed",
+        operation_id=operation_id,
+        category=category,
+        duration_seconds=round(time.monotonic() - started, 6),
+        status="succeeded" if returncode == 0 else "failed",
+        exit_status=returncode,
+    )
+    return returncode
 
 
 if __name__ == "__main__":
