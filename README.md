@@ -64,7 +64,7 @@ The installer detects supported runtime home directories and prepares local hook
 
 ![route2 optimization loop](assets/optimize_workflow.png)
 
-This route runs the optimization loop from the source repo without installing anything into your coding runtime. `orchestrator/optimize.py` owns the **outer loop** and spawns a fresh, clean Claude, Qoder, or Codex CLI session for each iteration. Select the backend with `--agent-cli claude|qodercli|codex` (default: `claude`). State crosses the session boundary only through disk (`memory/v<N>.json`, `plans/`, `profiles/`, and git), and HEAD is always the best kernel. Codex runs use `codex exec --json --ephemeral`; repository-scoped skills are prepared under each campaign's `.agents/skills/` without modifying the user's global Codex installation.
+This route runs the optimization loop from the source repo without installing anything into your coding runtime. `orchestrator/optimize.py` owns the **outer loop** and spawns a fresh, clean Claude, Qoder, Codex, or Pi CLI session for each iteration. Select the backend with `--agent-cli claude|qodercli|codex|pi` (default: `claude`). State crosses the session boundary only through disk (`memory/v<N>.json`, `plans/`, `profiles/`, and git), and HEAD is always the best kernel. Codex runs use `codex exec --json --ephemeral`; repository-scoped skills are prepared under each campaign's `.agents/skills/` without modifying the user's global Codex installation.
 
 For single-operator SOL and atrex-bench campaigns, the default outer flow first collects evaluator-faithful, production-visible runtime signatures in the sandbox. These signatures contain only explicit non-tensor arguments and tensor shape/stride/dtype/layout metadata—never tensor contents or evaluator-only workload values. The workload inspector runs in a data-minimized temporary workspace containing only those signatures and writes an exact, disjoint `workload_buckets.json`; every bucket boundary must therefore be reproducible by the no-sync production dispatcher, and indistinguishable signatures cannot be split. Every bucket then runs the original optimization loop concurrently in an independent Git workspace. The first ten iterations are an aggregation warmup: improvements are recorded but do not edit the main kernel. Once every bucket has reached at least V10 and has a committed improvement, the orchestrator deterministically copies every bucket's committed kernel and generates an exact runtime dispatcher—no coding-agent/LLM aggregation is used. Every later bucket improvement replaces only that bucket module and regenerates the dispatcher. Every candidate is accepted only after a separate full-workload, multi-seed correctness run and full-workload geomean benchmark beat the main incumbent. Dispatcher sources, visibility policy, provenance, pending improvements, accepted kernels, and rejected attempts are auditable in the main workspace's Git history, `dispatch_signatures.json`, `aggregate_dispatch.json`, and `aggregation_state.json`.
 
@@ -109,7 +109,7 @@ Key options:
 --aggregate-min-improvement-pct PCT # Full-workload gain required for aggregate acceptance
 --no-workload-bucketing # Restore the legacy single-workspace SOL flow
 --token-budget N     # Hard token cap across all sessions (0 = no cap)
---agent-cli CLI      # Optimization session backend: claude (default), qodercli, or codex
+--agent-cli CLI      # Optimization session backend: claude (default), qodercli, codex, or pi
 --optimization-mode MODE # leaderboard (default) or production
 --framework DSL      # One explicit DSL; omit to parallel-dispatch all supported DSLs
 --target-util PCT    # Peak-utilization %% short-circuit (default 90)
@@ -152,11 +152,12 @@ orchestrator deliberately does not compare their names or reported GPU models be
 may be aliased or desensitized. Runtime architecture probing remains authoritative when an omitted
 `--framework` requires vendor-specific dispatch.
 
-All three backends run non-interactively with clean session state and the same workspace-local skills,
+All four backends run non-interactively with clean session state and the same workspace-local skills,
 prompts, sandbox constraints, and quality gates. Authenticate the selected CLI first with
-`claude auth status`, `qodercli status`, or `codex login status`. Provider-specific settings can be
-supplied through `ATREX_CLAUDE_SESSION_SETTINGS`, `ATREX_QODER_SESSION_SETTINGS`, or
-`ATREX_CODEX_SESSION_SETTINGS`; `ATREX_SESSION_SETTINGS` remains the generic fallback. For Codex,
+`claude auth status`, `qodercli status`, `codex login status`, or `pi --list-models`. Provider-specific
+settings can be supplied through `ATREX_CLAUDE_SESSION_SETTINGS`, `ATREX_QODER_SESSION_SETTINGS`,
+`ATREX_CODEX_SESSION_SETTINGS`, or `ATREX_PI_SESSION_SETTINGS`; `ATREX_SESSION_SETTINGS` remains the
+generic fallback. For Codex,
 the setting value must be either a JSON object or a JSON array of literal `key=value` strings and is
 translated to repeatable `codex exec -c` arguments, for example:
 
@@ -164,8 +165,17 @@ translated to repeatable `codex exec -c` arguments, for example:
 export ATREX_CODEX_SESSION_SETTINGS='{"model":"gpt-5.6-sol","model_reasoning_effort":"xhigh"}'
 ```
 
+Pi uses `--mode json`, a unique persisted session id, and the configured Pi provider/model. Optional
+provider/model selection is restricted to non-secret CLI values:
+
+```bash
+export ATREX_PI_SESSION_SETTINGS='{"provider":"anthropic","model":"claude-opus"}'
+python orchestrator/optimize.py ... --agent-cli pi
+```
+
 Codex JSONL `turn.completed.usage` is included in token-budget accounting. Cache and reasoning
-sub-counters are not double-counted. Some Qoder models report zero token usage in stream JSON; in
+sub-counters are not double-counted. Pi finalized message usage, including cache read/write counters,
+is aggregated after `agent_settled`. Some Qoder models report zero token usage in stream JSON; in
 that case `--token-budget` cannot be enforced and `--max-iters` remains the hard campaign bound.
 
 ## Main Files

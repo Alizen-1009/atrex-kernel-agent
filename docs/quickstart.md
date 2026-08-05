@@ -14,7 +14,7 @@ AKA ships two independent ways to run the same profile-driven workflow. Use the 
 Route-specific prerequisites:
 
 - `install.sh` automatically installs `jq` with an available package manager when needed.
-- Route 2 requires Python 3, `torch`, and one of `claude`, `qodercli`, or `codex` available on `PATH`.
+- Route 2 requires Python 3, `torch`, and one of `claude`, `qodercli`, `codex`, or `pi` available on `PATH`.
 
 ## 1. Clone the Repository
 
@@ -78,6 +78,22 @@ export ATREX_CODEX_SESSION_SETTINGS='{"model":"gpt-5.6-sol","model_reasoning_eff
 
 These entries become repeatable `codex exec -c key=value` arguments. The default Codex reasoning effort
 is `max`; a value supplied through `ATREX_CODEX_SESSION_SETTINGS` appears later and overrides it.
+
+To use Pi, authenticate/configure a model with Pi first, then select it as the backend:
+
+```bash
+pi --list-models
+export ATREX_PI_SESSION_SETTINGS='{"provider":"anthropic","model":"claude-opus"}'  # optional
+python orchestrator/optimize.py \
+    --op-dir /path/to/sol-execbench/op \
+    --platform TARGET_GPU --sandbox-hardware REMOTE_GPU --framework Triton \
+    --agent-cli pi --max-iters 20 --token-budget 8000000
+```
+
+Pi runs in JSON mode with one unique persisted session per optimization attempt. The orchestrator trusts
+the generated campaign workspace for that run so Pi can load repository-scoped `.agents/skills`, while
+leaving provider credentials in Pi's normal auth/config files. `ATREX_PI_SESSION_SETTINGS` accepts only
+`provider` and `model`; API keys are never added to process arguments.
 
 Omit `--framework` to run every framework supported by the detected GPU concurrently:
 
