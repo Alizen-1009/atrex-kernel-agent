@@ -8,6 +8,8 @@ from orchestrator.agent_runtime import (
     CodexAdapter,
     QoderAdapter,
     TokenUsage,
+    subtract_token_usage,
+    token_usage_exceeds,
     token_usage_from_mapping,
 )
 
@@ -32,6 +34,14 @@ class TokenUsageNormalizationTest(unittest.TestCase):
                 measurement="exact",
             ),
         )
+
+    def test_component_overflow_is_not_hidden_by_a_larger_total(self) -> None:
+        observed = TokenUsage(12, 0, None, None, 12, "exact")
+        terminal = TokenUsage(10, 5, None, None, 15, "exact")
+
+        self.assertTrue(token_usage_exceeds(observed, terminal))
+        with self.assertRaisesRegex(ValueError, "exceeds total"):
+            subtract_token_usage(terminal, observed)
 
     def test_cache_creation_is_normalized_as_cache_write(self) -> None:
         usage = token_usage_from_mapping(

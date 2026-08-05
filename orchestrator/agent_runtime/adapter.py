@@ -12,6 +12,7 @@ from .model import (
     AgentRuntimeCapabilities,
     NormalizedAgentEvent,
     TokenUsage,
+    sum_token_usages,
 )
 
 
@@ -56,32 +57,6 @@ def token_usage_from_mapping(usage: object) -> TokenUsage:
         cache_write_tokens=cache_write_tokens,
         total_tokens=total_tokens,
         measurement="exact",
-    )
-
-
-def sum_token_usages(usages: list[TokenUsage]) -> TokenUsage:
-    observed = [usage for usage in usages if usage.total_tokens is not None]
-    if not observed:
-        return TokenUsage.unavailable()
-
-    def sum_component(name: str) -> int | None:
-        values = [getattr(usage, name) for usage in observed]
-        if any(value is None for value in values):
-            return None
-        return sum(value for value in values if value is not None)
-
-    return TokenUsage(
-        input_tokens=sum_component("input_tokens"),
-        output_tokens=sum_component("output_tokens"),
-        cache_read_tokens=sum_component("cache_read_tokens"),
-        cache_write_tokens=sum_component("cache_write_tokens"),
-        total_tokens=sum(usage.total_tokens or 0 for usage in observed),
-        measurement=(
-            "exact"
-            if len(observed) == len(usages)
-            and all(usage.measurement == "exact" for usage in observed)
-            else "partial"
-        ),
     )
 
 

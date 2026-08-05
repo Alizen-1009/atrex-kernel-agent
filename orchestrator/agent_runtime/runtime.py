@@ -15,12 +15,17 @@ from .adapter import (
     CodexAdapter,
     QoderAdapter,
     codex_settings_args,
-    sum_token_usages,
     token_usage_from_mapping,
     token_usage_from_model_usage,
     toml_config_value,
 )
-from .model import AgentRunRequest, AgentRunResult, AgentRuntime, TokenUsage
+from .model import (
+    AgentRunRequest,
+    AgentRunResult,
+    AgentRuntime,
+    TokenUsage,
+    sum_token_usages,
+)
 from .process import ProcessRunner, protected_gateway_identity, run_bounded
 
 

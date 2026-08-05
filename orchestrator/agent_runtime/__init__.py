@@ -16,6 +16,9 @@ from .model import (
     AgentRuntimeCapabilities,
     NormalizedAgentEvent,
     TokenUsage,
+    subtract_token_usage,
+    sum_token_usages,
+    token_usage_exceeds,
 )
 from .process import (
     DEFAULT_PROTECTED_GATEWAY_SCREEN,
@@ -73,6 +76,9 @@ __all__ = [
     "protected_gateway_identity",
     "python_import_roots",
     "run_bounded",
+    "subtract_token_usage",
+    "sum_token_usages",
+    "token_usage_exceeds",
     "token_usage_from_mapping",
     "token_usage_from_stream",
     "toml_config_value",
