@@ -30,6 +30,7 @@ PHASES = (
     "implementation",
     "correctness",
     "benchmark",
+    "recording",
 )
 
 
@@ -63,6 +64,7 @@ def summarize_phase_tokens(
     all_deltas: list[TokenUsage] = []
     active_phase: str | None = None
     active_usage: list[TokenUsage] = []
+    pending_start_usage: TokenUsage | None = None
     invalid_stack: list[str] = []
 
     if not capabilities.usage_delta or not capabilities.usage_delta_observed:
@@ -82,12 +84,19 @@ def summarize_phase_tokens(
                 }
                 for phase in PHASES
             },
+            "orchestration": None,
             "unattributed": (
                 usage_dict(terminal_usage)
                 if terminal_usage.total_tokens is not None
                 else None
             ),
             "coverage": (
+                0.0 if terminal_usage.total_tokens is not None else None
+            ),
+            "semantic_phase_coverage": (
+                0.0 if terminal_usage.total_tokens is not None else None
+            ),
+            "accounted_coverage": (
                 0.0 if terminal_usage.total_tokens is not None else None
             ),
             "measurement": "unavailable",
@@ -104,6 +113,9 @@ def summarize_phase_tokens(
             all_deltas.append(event.usage)
             if active_phase is not None and not invalid_stack:
                 active_usage.append(event.usage)
+                pending_start_usage = None
+            elif not invalid_stack:
+                pending_start_usage = event.usage
             continue
         if event.kind != "phase_marker":
             continue
@@ -111,6 +123,7 @@ def summarize_phase_tokens(
         action = event.action
         if phase not in phase_intervals or action not in {"start", "end"}:
             reason_codes.append("invalid_phase_marker")
+            pending_start_usage = None
             continue
 
         if invalid_stack:
@@ -127,21 +140,27 @@ def summarize_phase_tokens(
                     invalid_stack.pop()
             else:
                 reason_codes.append("orphan_phase_end")
+            pending_start_usage = None
             continue
 
         if action == "start":
             if active_phase is None:
                 active_phase = phase
-                active_usage = []
+                active_usage = (
+                    [pending_start_usage] if pending_start_usage is not None else []
+                )
+                pending_start_usage = None
             else:
                 reason_codes.append("overlapping_phase")
                 invalid_stack = [active_phase, phase]
                 active_phase = None
                 active_usage = []
+                pending_start_usage = None
             continue
 
         if active_phase is None:
             reason_codes.append("orphan_phase_end")
+            pending_start_usage = None
         elif active_phase == phase:
             phase_intervals[phase].append(active_usage)
             active_phase = None
@@ -181,15 +200,20 @@ def summarize_phase_tokens(
     terminal_total = terminal_usage.total_tokens
     attributed_total = attributed.total_tokens
     observed_delta_total = observed_delta.total_tokens
+    orchestration: TokenUsage | None
+    unattributed: TokenUsage | None
+    accounted_coverage: float | None
     if terminal_total is None:
-        unattributed = (
+        orchestration = (
             subtract_token_usage(observed_delta, attributed)
             if observed_delta_total is not None
             and attributed_total is not None
-            and observed_delta_total >= attributed_total
+            and not token_usage_exceeds(attributed, observed_delta)
             else None
         )
+        unattributed = None
         coverage = None
+        accounted_coverage = None
         reconciliation = "unavailable"
         measurement = "partial" if attributed_usages else "unavailable"
         reason_codes.append("terminal_usage_unavailable")
@@ -199,18 +223,22 @@ def summarize_phase_tokens(
         or token_usage_exceeds(attributed, terminal_usage)
         or token_usage_exceeds(observed_delta, terminal_usage)
     ):
+        orchestration = None
         unattributed = None
         coverage = None
+        accounted_coverage = None
         reconciliation = "inconsistent"
         measurement = "partial"
         reason_codes.append("usage_delta_exceeds_terminal")
     else:
-        unattributed = subtract_token_usage(terminal_usage, attributed)
+        orchestration = subtract_token_usage(terminal_usage, attributed)
+        unattributed = TokenUsage.zero()
         coverage = (
             round(attributed_total / terminal_total, 6)
             if terminal_total > 0
             else (1.0 if attributed_total == 0 else None)
         )
+        accounted_coverage = 1.0
         reconciliation = "reconciled"
         measurement = (
             "exact"
@@ -224,8 +252,11 @@ def summarize_phase_tokens(
     return {
         "terminal_usage": usage_dict(terminal_usage),
         "phases": phase_payload,
+        "orchestration": usage_dict(orchestration) if orchestration else None,
         "unattributed": usage_dict(unattributed) if unattributed else None,
         "coverage": coverage,
+        "semantic_phase_coverage": coverage,
+        "accounted_coverage": accounted_coverage,
         "measurement": measurement,
         "reconciliation_status": reconciliation,
         "reason_codes": sorted(set(reason_codes)),
@@ -345,6 +376,7 @@ def aggregate_attempt_tokens(attempts: Sequence[Mapping[str, Any]]) -> dict[str,
         reasons.add("attempt_terminal_usage_unavailable")
 
     coverage_attributed_usages: list[TokenUsage] = []
+    observed_orchestration: list[TokenUsage] = []
     observed_unattributed: list[TokenUsage] = []
     reconciliation_values: set[str] = set()
     for summary in token_summaries:
@@ -361,32 +393,52 @@ def aggregate_attempt_tokens(attempts: Sequence[Mapping[str, Any]]) -> dict[str,
                 phase_usage = _usage_from_dict(value.get("usage"))
                 if phase_usage.total_tokens is not None:
                     coverage_attributed_usages.append(phase_usage)
+        attempt_orchestration = _usage_from_dict(summary.get("orchestration"))
+        if attempt_orchestration.total_tokens is not None:
+            observed_orchestration.append(attempt_orchestration)
         attempt_unattributed = _usage_from_dict(summary.get("unattributed"))
         if attempt_unattributed.total_tokens is not None:
             observed_unattributed.append(attempt_unattributed)
 
     coverage_attributed = _sum_phase_usages(coverage_attributed_usages)
     coverage_attributed_total = coverage_attributed.total_tokens or 0
+    orchestration: TokenUsage | None
+    accounted_coverage: float | None
     if "inconsistent" in reconciliation_values:
         reconciliation = "inconsistent"
+        orchestration = None
         unattributed = None
         coverage = None
+        accounted_coverage = None
     elif terminal.total_tokens is None:
         reconciliation = "unavailable"
+        orchestration = None
         unattributed = None
         coverage = None
+        accounted_coverage = None
     elif token_usage_exceeds(coverage_attributed, terminal):
         reconciliation = "inconsistent"
+        orchestration = None
         unattributed = None
         coverage = None
+        accounted_coverage = None
         reasons.add("usage_delta_exceeds_terminal")
     else:
         reconciliation = "reconciled"
+        orchestration = _sum_phase_usages(observed_orchestration)
         unattributed = _sum_phase_usages(observed_unattributed)
         coverage = (
             round(coverage_attributed_total / terminal.total_tokens, 6)
             if terminal.total_tokens > 0
             else (1.0 if coverage_attributed_total == 0 else None)
+        )
+        accounted_total = coverage_attributed_total + (
+            orchestration.total_tokens or 0
+        )
+        accounted_coverage = (
+            round(accounted_total / terminal.total_tokens, 6)
+            if terminal.total_tokens > 0
+            else (1.0 if accounted_total == 0 else None)
         )
 
     measurement = (
@@ -401,8 +453,11 @@ def aggregate_attempt_tokens(attempts: Sequence[Mapping[str, Any]]) -> dict[str,
     return {
         "terminal_usage": usage_dict(terminal),
         "phases": phases,
+        "orchestration": usage_dict(orchestration) if orchestration else None,
         "unattributed": usage_dict(unattributed) if unattributed else None,
         "coverage": coverage,
+        "semantic_phase_coverage": coverage,
+        "accounted_coverage": accounted_coverage,
         "measurement": measurement,
         "reconciliation_status": reconciliation,
         "reason_codes": reasons,

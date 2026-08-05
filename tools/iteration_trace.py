@@ -13,7 +13,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-PHASES = {"profile", "research", "planning", "implementation", "correctness", "benchmark"}
+PHASES = {
+    "profile",
+    "research",
+    "planning",
+    "implementation",
+    "correctness",
+    "benchmark",
+    "recording",
+}
 SOURCE_KINDS = {"gpu_wiki", "reference_projects", "workspace", "public_web", "unknown"}
 
 

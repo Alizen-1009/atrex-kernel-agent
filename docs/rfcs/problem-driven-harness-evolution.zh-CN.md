@@ -373,7 +373,7 @@ Observability 是 read-only 的。它不决定 candidate acceptance、repair sta
 
 1. 总 wall time 是多少？
 2. 每个 Agent attempt 运行了多久？
-3. Profile、research、planning、implementation、correctness 和 benchmark phase 各花了多久？
+3. Profile、research、planning、implementation、correctness、benchmark、recording 和 orchestration phase 各花了多久？
 4. 这些 phase 的完整 explicit interval 内报告了多少 input、output、cache-read、cache-write 和 total token？
 5. 读取了哪些 gpu-wiki、reference-project、workspace 或 public-web source？
 6. Source-read tool 和 sandbox operation 各花了多久？
@@ -436,7 +436,8 @@ Duration 使用 monotonic time；wall-clock UTC 只用于 correlation 和可读�
 1. **Exact harness boundary：** iteration、Agent process 和 sandbox operation start/end。
 2. **Explicit Agent marker：** ordinary iteration prompt 要求 Agent 通过一个小型 local tracing helper 标记 `research`、`planning` 和 `implementation` phase boundary。
 3. **Inferred fallback：** backend tool event 与 command 可以推断缺失 phase，例如 wiki read 归入 research、plan write 归入 planning、kernel edit 归入 implementation、evaluator command 归入 validation。
-4. **Unattributed：** 无法在不猜测情况下归类的时间保留为 unattributed。
+4. **Orchestration：** 合法 semantic phase interval 之外的时间，确定性地归类为 session setup、transition 或 recording overhead。
+5. **Unattributed：** 只有 terminal accounting unavailable 或 inconsistent 时才保留 unattributed。
 
 每个 phase value 都带有以下 measurement：
 
@@ -450,13 +451,14 @@ Top-level phase span 不得重复计数。Nested tool duration 与 phase wall ti
 
 Token attribution 使用比时间归因更严格的模型：
 
-- 固定 phase 为 `profile`、`research`、`planning`、`implementation`、`correctness` 和 `benchmark`；
+- explicit phase 为 `profile`、`research`、`planning`、`implementation`、`correctness`、`benchmark` 和 `recording`；`recording` 覆盖 acceptance/revert、memory、Git 与 handoff；
 - phase interval 可以重复，但不能重叠；
 - 只有完整匹配、非重叠的 explicit marker pair 才允许归因；
 - marker helper 只有在 trace 写入成功后才输出 machine-readable receipt；
+- standalone `phase-start` receipt 成功后，将生成该 marker command 的紧邻前一个 usage delta 回溯归入新 phase；
 - backend adapter 将 message usage 归一化为 `usage_delta`，将 session 最终 usage 归一化为 `terminal_usage`；parser capability 本身不构成证据，本次 session 未观察到 delta 时仍为 unavailable；
 - 缺失、非法、嵌套或未闭合的 interval 不根据 tool behavior 推断；
-- 无法归因的 token 保留在显式 `unattributed` bucket；
+- 完整 explicit phase interval 之外的有效 usage 放入 derived `orchestration` bucket；`unattributed` 只保留 unavailable 或 inconsistent accounting；
 - input token 归属于模型实际处理它的 phase，即使 context 来自更早的 phase；
 - input、output、cache-read、cache-write 和 total counter 分开保留；backend 缺失字段为 `null`，不是零；
 - usage delta 的 total 或任一双方可用 component 超过 terminal usage 时保留 `inconsistent` 冲突，不 clamp 或按比例缩放 phase value；
@@ -516,11 +518,11 @@ runtime_failure | infrastructure_failure | interrupted | unknown
 - phase wall-time 和 percentage breakdown；
 - sandbox operation breakdown；
 - source-read count、unique ref、repeat 与 tool time；
-- per-attempt 与 aggregate structured phase token usage、unattributed usage、coverage 和 reconciliation status；
+- per-attempt 与 aggregate structured phase token usage、orchestration overhead、unattributed usage、semantic/accounted coverage 和 reconciliation status；
 - changed-file metadata；
 - observed outcome 与 reason code；
 - 每部分 coverage/measurement quality；
-- unattributed duration。
+- orchestration 与真正 unattributed duration。
 
 Percentage 使用 non-overlapping top-level phase wall time 除以 total iteration wall time。禁止通过虚构 attribution 强行凑到 100%。
 
@@ -545,7 +547,7 @@ Percentage 使用 non-overlapping top-level phase wall time 除以 total iterati
 - 一个普通 iteration 产生有界 local trace 和 summary；
 - total wall time、Agent time 和 sandbox duration 在定义 tolerance 内 reconciliation；
 - phase、source 与 token coverage 显式报告 uncertainty；
-- attributed token usage 加 unattributed usage 与 observed terminal usage reconciliation，或报告显式 inconsistency；
+- semantic phase usage 加 orchestration 与真正 unattributed usage，与 observed terminal usage reconciliation，或报告显式 inconsistency；
 - 不增加额外 Agent 或 GPU call；
 - Git、memory、stall 与 acceptance 行为不变；
 - 测量并限制 overhead；如果不足以 default-on，则 trace 改为 opt-in 或 sampled。
@@ -802,7 +804,7 @@ Harness mechanism 只有在目标 reliability metric 提升、同时 optimizatio
 - 增加 ignored local trace 与 summary format；
 - 为 Agent、phase marker、source read、sandbox、file change 和 observed outcome event 打时间戳；
 - 通过 selected AgentRuntime adapter 归一化 backend usage delta、terminal usage 和成功 marker receipt；
-- 只把 structured token usage 归因到完整 explicit phase interval，并保留 unattributed bucket；
+- 将 structured token usage 归因到完整 explicit phase interval，把有效 residual usage 归类为 orchestration，并只在 unavailable/inconsistent accounting 时保留 unattributed；
 - instrument sandbox timing，但不增加 GPU call；
 - 增加 read-only summary renderer；
 - 证明 Git、memory、stall 和 acceptance 行为不变。

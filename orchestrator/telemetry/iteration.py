@@ -213,15 +213,19 @@ def _summarize_events(
     attributed_seconds = sum(durations.values())
     if attributed_seconds > total_seconds:
         timing_reasons.add("phase_time_exceeds_iteration")
-    unattributed_seconds = max(0.0, total_seconds - attributed_seconds)
+    orchestration_seconds = max(0.0, total_seconds - attributed_seconds)
+    semantic_coverage = (
+        round(attributed_seconds / total_seconds, 6)
+        if total_seconds > 0
+        else None
+    )
     timing_summary = {
         "attributed_seconds": round(attributed_seconds, 6),
-        "unattributed_seconds": round(unattributed_seconds, 6),
-        "coverage": (
-            round(attributed_seconds / total_seconds, 6)
-            if total_seconds > 0
-            else None
-        ),
+        "orchestration_seconds": round(orchestration_seconds, 6),
+        "unattributed_seconds": 0.0 if total_seconds >= attributed_seconds else None,
+        "coverage": semantic_coverage,
+        "semantic_phase_coverage": semantic_coverage,
+        "accounted_coverage": 1.0 if total_seconds >= attributed_seconds else None,
         "measurement": (
             "partial"
             if timing_reasons
@@ -331,23 +335,24 @@ def render_iteration_brief(summary: Mapping[str, Any]) -> str:
             )
             + " |"
         )
-    unattributed = token_summary.get("unattributed")
-    unattributed = unattributed if isinstance(unattributed, Mapping) else {}
-    token_rows.append(
-        "| "
-        + " | ".join(
-            [
-                "unattributed",
-                token_cell(unattributed.get("input_tokens")),
-                token_cell(unattributed.get("output_tokens")),
-                token_cell(unattributed.get("cache_read_tokens")),
-                token_cell(unattributed.get("cache_write_tokens")),
-                token_cell(unattributed.get("total_tokens")),
-                str(unattributed.get("measurement") or "unavailable"),
-            ]
+    for label in ("orchestration", "unattributed"):
+        usage = token_summary.get(label)
+        usage = usage if isinstance(usage, Mapping) else {}
+        token_rows.append(
+            "| "
+            + " | ".join(
+                [
+                    label,
+                    token_cell(usage.get("input_tokens")),
+                    token_cell(usage.get("output_tokens")),
+                    token_cell(usage.get("cache_read_tokens")),
+                    token_cell(usage.get("cache_write_tokens")),
+                    token_cell(usage.get("total_tokens")),
+                    str(usage.get("measurement") or "unavailable"),
+                ]
+            )
+            + " |"
         )
-        + " |"
-    )
     lines = [
         f"# Iteration {summary.get('iteration_id') or 'unknown'}",
         "",
@@ -357,14 +362,16 @@ def render_iteration_brief(summary: Mapping[str, Any]) -> str:
         f"- phases: {phase_text}",
         f"- source reads: `{int(source_reads.get('count') or 0)}` / unique `{int(source_reads.get('unique_count') or 0)}` ({source_reads.get('coverage') or 'unavailable'})",
         f"- sandbox: `{float(sandbox.get('total_seconds') or 0.0):.1f}s` ({sandbox.get('coverage') or 'unavailable'})",
+        f"- orchestration time: `{float(summary.get('orchestration_wall_seconds') or 0.0):.1f}s`",
         f"- unattributed time: `{float(summary.get('unattributed_wall_seconds') or 0.0):.1f}s`",
-        "- token coverage: `"
+        "- semantic token coverage: `"
         + (
             str(token_summary.get("coverage"))
             if isinstance(token_summary.get("coverage"), (int, float))
             else "unavailable"
         )
         + f"` ({token_summary.get('measurement') or 'unavailable'})",
+        f"- accounted token coverage: `{token_summary.get('accounted_coverage') if token_summary.get('accounted_coverage') is not None else 'unavailable'}`",
         "",
         "## Phase token usage",
         "",
@@ -653,6 +660,7 @@ class IterationTelemetryRecorder:
                 "sandbox_operations": sandbox_operations["coverage"],
                 "phase_tokens": phase_tokens["measurement"],
             },
+            "orchestration_wall_seconds": phase_timing["orchestration_seconds"],
             "unattributed_wall_seconds": phase_timing["unattributed_seconds"],
         }
         _atomic_json(self.attempt_summary_path, attempt)

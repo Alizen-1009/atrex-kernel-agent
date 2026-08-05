@@ -373,7 +373,7 @@ For one ordinary iteration:
 
 1. What was the total wall time?
 2. How long did each Agent attempt run?
-3. How much time was spent in profile, research, planning, implementation, correctness, and benchmark phases?
+3. How much time was spent in profile, research, planning, implementation, correctness, benchmark, recording, and orchestration phases?
 4. How many input, output, cache-read, cache-write, and total tokens were reported inside complete explicit intervals for those phases?
 5. Which gpu-wiki, reference-project, workspace, or public-web sources were read?
 6. How long did source-read tools and sandbox operations take?
@@ -436,7 +436,8 @@ Use a mixed model:
 1. **Exact harness boundaries:** iteration, Agent process, and sandbox operation start/end.
 2. **Explicit Agent markers:** the ordinary iteration prompt asks the Agent to mark `research`, `planning`, and `implementation` phase boundaries through a small local tracing helper.
 3. **Inferred fallback:** backend tool events and commands may infer missing phases—for example wiki reads as research, plan writes as planning, kernel edits as implementation, and evaluator commands as validation.
-4. **Unattributed:** time that cannot be assigned without guessing remains unattributed.
+4. **Orchestration:** time outside valid semantic phase intervals is deterministically classified as session setup, transition, or recording overhead.
+5. **Unattributed:** time remains unattributed only when terminal accounting is unavailable or inconsistent.
 
 Every phase value includes one of:
 
@@ -450,13 +451,14 @@ Top-level phase spans must not be double-counted. Nested tool duration is report
 
 Token attribution uses a stricter model than time attribution:
 
-- the fixed phases are `profile`, `research`, `planning`, `implementation`, `correctness`, and `benchmark`;
+- the explicit phases are `profile`, `research`, `planning`, `implementation`, `correctness`, `benchmark`, and `recording`; `recording` covers acceptance/revert, memory, Git, and handoff work;
 - phase intervals may repeat but may not overlap;
 - only complete, matching, non-overlapping explicit marker pairs are eligible;
 - the marker helper emits a machine-readable receipt only after the trace write succeeds;
+- after a successful standalone `phase-start` receipt, the immediately preceding usage delta that generated that marker command is retroactively included in the new phase;
 - backend adapters normalize message usage as `usage_delta` and final session usage as `terminal_usage`; parser capability alone is not evidence, so a session with no observed delta remains unavailable;
 - missing, malformed, nested, or unclosed intervals are never inferred from tool behavior;
-- unassigned token usage remains in an explicit `unattributed` bucket;
+- usage outside complete explicit phase intervals is reported in a derived `orchestration` bucket; `unattributed` is reserved for unavailable or inconsistent accounting;
 - input token usage belongs to the phase in which the model processed it, even when the context originated in an earlier phase;
 - input, output, cache-read, cache-write, and total counters remain separate; missing backend fields are `null`, not zero;
 - if usage deltas exceed terminal usage in total or in any mutually available component, retain the conflict as `inconsistent` rather than clamping or scaling phase values;
@@ -516,11 +518,11 @@ This normalization is diagnostic only. If memory and Git disagree, emit `unknown
 - phase wall-time and percentage breakdown;
 - sandbox operation breakdown;
 - source-read counts, unique refs, repeats, and tool time;
-- per-attempt and aggregate structured phase token usage, unattributed usage, coverage, and reconciliation status;
+- per-attempt and aggregate structured phase token usage, orchestration overhead, unattributed usage, semantic/accounted coverage, and reconciliation status;
 - changed-file metadata;
 - observed outcome and reason codes;
 - coverage/measurement quality for every section;
-- unattributed duration.
+- orchestration and truly unattributed duration.
 
 Percentages use non-overlapping top-level phase wall time divided by total iteration wall time. They must not be forced to 100% by inventing attribution.
 
@@ -545,7 +547,7 @@ Use fake clocks and fixture streams to cover:
 - one ordinary iteration produces a bounded local trace and summary;
 - total wall time, Agent time, and sandbox duration reconcile within defined tolerances;
 - phase, source, and token coverage explicitly report uncertainty;
-- attributed token usage plus unattributed usage reconciles to observed terminal usage, or reports an explicit inconsistency;
+- semantic phase usage plus orchestration plus truly unattributed usage reconciles to observed terminal usage, or reports an explicit inconsistency;
 - no extra Agent or GPU call is introduced;
 - no Git, memory, stall, or acceptance behavior changes;
 - overhead is measured and remains small enough for default-on local telemetry, otherwise tracing becomes opt-in or sampled.
@@ -802,7 +804,7 @@ Add this problem-driven plan in English and Chinese. No runtime behavior changes
 - add the ignored local trace and summary format;
 - timestamp Agent, phase-marker, source-read, sandbox, file-change, and observed-outcome events;
 - normalize backend usage deltas, terminal usage, and successful marker receipts through the selected AgentRuntime adapter;
-- attribute structured token usage only to complete explicit phase intervals and retain an unattributed bucket;
+- attribute structured token usage to complete explicit phase intervals, classify valid residual usage as orchestration, and reserve unattributed for unavailable/inconsistent accounting;
 - instrument sandbox timing without adding GPU calls;
 - add a read-only summary renderer;
 - prove that Git, memory, stall, and acceptance behavior are unchanged.

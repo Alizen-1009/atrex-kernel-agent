@@ -72,10 +72,12 @@ class PhaseTokenSummaryTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            summary["phases"]["research"]["usage"]["total_tokens"], 109
+            summary["phases"]["research"]["usage"]["total_tokens"], 214
         )
         self.assertEqual(summary["terminal_usage"]["total_tokens"], 326)
-        self.assertEqual(summary["unattributed"]["total_tokens"], 217)
+        self.assertEqual(summary["orchestration"]["total_tokens"], 112)
+        self.assertEqual(summary["unattributed"]["total_tokens"], 0)
+        self.assertEqual(summary["accounted_coverage"], 1.0)
         self.assertEqual(summary["reconciliation_status"], "reconciled")
 
     def test_complete_non_overlapping_intervals_are_attributed_and_reconciled(self) -> None:
@@ -96,11 +98,13 @@ class PhaseTokenSummaryTest(unittest.TestCase):
             observation_errors=(),
         )
 
-        self.assertEqual(summary["phases"]["research"]["usage"]["total_tokens"], 10)
+        self.assertEqual(summary["phases"]["research"]["usage"]["total_tokens"], 12)
         self.assertEqual(summary["phases"]["implementation"]["usage"]["total_tokens"], 20)
         self.assertEqual(summary["phases"]["planning"]["measurement"], "unavailable")
-        self.assertEqual(summary["unattributed"]["total_tokens"], 10)
-        self.assertEqual(summary["coverage"], 0.75)
+        self.assertEqual(summary["orchestration"]["total_tokens"], 8)
+        self.assertEqual(summary["unattributed"]["total_tokens"], 0)
+        self.assertEqual(summary["coverage"], 0.8)
+        self.assertEqual(summary["accounted_coverage"], 1.0)
         self.assertEqual(summary["reconciliation_status"], "reconciled")
 
     def test_repeated_phase_intervals_are_summed(self) -> None:
@@ -145,7 +149,9 @@ class PhaseTokenSummaryTest(unittest.TestCase):
 
         self.assertIsNone(summary["phases"]["research"]["usage"])
         self.assertIsNone(summary["phases"]["benchmark"]["usage"])
-        self.assertEqual(summary["unattributed"]["total_tokens"], 12)
+        self.assertEqual(summary["orchestration"]["total_tokens"], 12)
+        self.assertEqual(summary["unattributed"]["total_tokens"], 0)
+        self.assertEqual(summary["accounted_coverage"], 1.0)
         self.assertIn("overlapping_phase", summary["reason_codes"])
         self.assertIn("unclosed_phase", summary["reason_codes"])
 
@@ -224,7 +230,9 @@ class PhaseTokenSummaryTest(unittest.TestCase):
         self.assertEqual(aggregate["attempts_with_terminal_usage"], 1)
         self.assertEqual(aggregate["phases"]["research"]["usage"]["total_tokens"], 4)
         self.assertEqual(aggregate["coverage"], 0.5)
-        self.assertEqual(aggregate["unattributed"]["total_tokens"], 10)
+        self.assertEqual(aggregate["orchestration"]["total_tokens"], 10)
+        self.assertEqual(aggregate["unattributed"]["total_tokens"], 0)
+        self.assertEqual(aggregate["accounted_coverage"], 1.0)
         self.assertIn("attempt_terminal_usage_unavailable", aggregate["reason_codes"])
 
     def test_supported_but_unobserved_deltas_do_not_become_exact_zero(self) -> None:
@@ -258,7 +266,7 @@ class PhaseTokenSummaryTest(unittest.TestCase):
 
 
 class IterationTelemetryTest(unittest.TestCase):
-    def test_phase_timing_rejects_overlap_and_keeps_time_unattributed(self) -> None:
+    def test_phase_timing_rejects_overlap_and_tracks_orchestration(self) -> None:
         events = [
             {"event": "phase_started", "phase": "research", "monotonic_seconds": 1.0},
             {"event": "phase_started", "phase": "implementation", "monotonic_seconds": 2.0},
@@ -271,7 +279,9 @@ class IterationTelemetryTest(unittest.TestCase):
         self.assertIsNone(phases["research"]["wall_seconds"])
         self.assertIsNone(phases["implementation"]["wall_seconds"])
         self.assertEqual(timing["attributed_seconds"], 0.0)
-        self.assertEqual(timing["unattributed_seconds"], 10.0)
+        self.assertEqual(timing["orchestration_seconds"], 10.0)
+        self.assertEqual(timing["unattributed_seconds"], 0.0)
+        self.assertEqual(timing["accounted_coverage"], 1.0)
         self.assertIn("overlapping_phase", timing["reason_codes"])
 
     def _recorder(
@@ -331,9 +341,12 @@ class IterationTelemetryTest(unittest.TestCase):
             10,
         )
         self.assertEqual(summary["phase_tokens"]["terminal_usage"]["total_tokens"], 20)
-        self.assertEqual(summary["phase_tokens"]["unattributed"]["total_tokens"], 10)
+        self.assertEqual(summary["phase_tokens"]["orchestration"]["total_tokens"], 10)
+        self.assertEqual(summary["phase_tokens"]["unattributed"]["total_tokens"], 0)
+        self.assertEqual(summary["phase_tokens"]["accounted_coverage"], 1.0)
         self.assertIn("## Phase token usage", brief)
         self.assertIn("| research | 9 | 1 |", brief)
+        self.assertIn("| orchestration | 10 | 0 |", brief)
         self.assertNotIn("raw parser", trace)
 
     def test_iteration_summary_aggregates_all_attempt_tokens(self) -> None:
@@ -389,9 +402,11 @@ class IterationTelemetryTest(unittest.TestCase):
         self.assertEqual(tokens["terminal_usage"]["total_tokens"], 30)
         self.assertEqual(tokens["phases"]["research"]["usage"]["total_tokens"], 4)
         self.assertEqual(tokens["phases"]["implementation"]["usage"]["total_tokens"], 10)
-        self.assertEqual(tokens["unattributed"]["input_tokens"], 16)
-        self.assertEqual(tokens["unattributed"]["output_tokens"], 0)
-        self.assertEqual(tokens["unattributed"]["total_tokens"], 16)
+        self.assertEqual(tokens["orchestration"]["input_tokens"], 16)
+        self.assertEqual(tokens["orchestration"]["output_tokens"], 0)
+        self.assertEqual(tokens["orchestration"]["total_tokens"], 16)
+        self.assertEqual(tokens["unattributed"]["total_tokens"], 0)
+        self.assertEqual(tokens["accounted_coverage"], 1.0)
 
     def test_campaign_helpers_record_one_local_attempt(self) -> None:
         with tempfile.TemporaryDirectory(prefix="campaign-telemetry-") as temp_dir:
@@ -673,7 +688,9 @@ class IterationTelemetryTest(unittest.TestCase):
         self.assertEqual(summary["phases"]["research"]["measurement"], "explicit")
         self.assertEqual(summary["phases"]["research"]["wall_seconds"], 2.0)
         self.assertEqual(summary["phase_timing"]["attributed_seconds"], 2.0)
-        self.assertEqual(summary["unattributed_wall_seconds"], 13.0)
+        self.assertEqual(summary["orchestration_wall_seconds"], 13.0)
+        self.assertEqual(summary["unattributed_wall_seconds"], 0.0)
+        self.assertEqual(summary["phase_timing"]["accounted_coverage"], 1.0)
         self.assertEqual(summary["source_reads"]["coverage"], "explicit")
         self.assertEqual(summary["source_reads"]["unique_count"], 1)
         self.assertEqual(summary["sandbox_operations"]["coverage"], "exact")
