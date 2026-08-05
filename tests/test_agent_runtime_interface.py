@@ -81,6 +81,7 @@ class AgentRuntimeInterfaceTest(unittest.TestCase):
             ),
         )
         self.assertEqual([event.kind for event in result.events], ["terminal_usage"])
+        self.assertFalse(result.capabilities.usage_delta_observed)
         self.assertEqual(result.stderr_tail, "stderr")
 
     def test_adapter_normalizes_message_deltas_separately_from_terminal_usage(self) -> None:
@@ -111,6 +112,7 @@ class AgentRuntimeInterfaceTest(unittest.TestCase):
         )
         self.assertEqual(result.events[0].usage.total_tokens, 5)
         self.assertEqual(result.terminal_usage.total_tokens, 5)
+        self.assertTrue(result.capabilities.usage_delta_observed)
 
     def test_custom_adapter_can_be_registered_without_changing_the_runtime(self) -> None:
         class FakeAdapter(AgentBackendAdapter):

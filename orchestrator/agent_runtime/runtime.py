@@ -170,13 +170,19 @@ class CliAgentRuntime:
             observation_errors = (
                 f"stream_normalization_failed:{type(exc).__name__}",
             )
+        capabilities = replace(
+            self._adapter.capabilities,
+            usage_delta_observed=any(
+                event.kind == "usage_delta" for event in events
+            ),
+        )
         return AgentRunResult(
             runtime_id=self.id,
             exit_status=exit_status,
             timed_out=timed_out,
             terminal_usage=terminal_usage,
             events=events,
-            capabilities=self._adapter.capabilities,
+            capabilities=capabilities,
             observation_errors=observation_errors,
             stdout_tail=stdout[-2000:],
             stderr_tail=stderr[-2000:],

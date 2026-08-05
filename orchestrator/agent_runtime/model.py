@@ -47,6 +47,7 @@ class AgentRuntimeCapabilities:
     terminal_usage: bool
     usage_delta: bool
     phase_marker_receipt: bool
+    usage_delta_observed: bool = False
 
 
 @dataclass(frozen=True)
