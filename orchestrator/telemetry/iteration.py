@@ -10,11 +10,18 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from ..agent_runtime.model import (
-    AgentRuntimeCapabilities,
-    NormalizedAgentEvent,
-    TokenUsage,
-)
+try:
+    from ..agent_runtime.model import (
+        AgentRuntimeCapabilities,
+        NormalizedAgentEvent,
+        TokenUsage,
+    )
+except ImportError:  # direct script execution: python orchestrator/optimize.py
+    from agent_runtime.model import (  # type: ignore[no-redef]
+        AgentRuntimeCapabilities,
+        NormalizedAgentEvent,
+        TokenUsage,
+    )
 
 
 EVENT_SCHEMA_VERSION = "atrex_iteration_event_v1"

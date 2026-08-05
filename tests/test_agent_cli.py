@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +12,18 @@ from orchestrator import optimize
 
 
 class AgentCliTest(unittest.TestCase):
+    def test_optimize_help_supports_direct_script_execution(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, "orchestrator/optimize.py", "--help"],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--agent-cli", completed.stdout)
+
     def test_codex_and_pi_are_supported_backends(self) -> None:
         self.assertIn("codex", optimize.AGENT_CLI_CHOICES)
         self.assertIn("pi", optimize.AGENT_CLI_CHOICES)
