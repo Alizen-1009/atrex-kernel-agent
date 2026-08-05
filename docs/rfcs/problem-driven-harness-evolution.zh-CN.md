@@ -15,7 +15,7 @@ Atrex 需要更清晰的 harness，但更大的 harness 不会自动带来更好
 
 > 先观察真实故障或重复变更成本，复现并测量它，再引入能够拥有该问题的最小机制；当问题被解决后停止继续扩张。
 
-目前唯一已经被多个真实实现证明合理的架构抽取是 `AgentRuntime`：Atrex 已支持 Claude、Qoder 和 Codex，但它们的 command、environment、token、authentication 与 skill-hydration 行为混杂在 `orchestrator/optimize.py` 中。
+目前唯一已经被多个真实实现证明合理的架构抽取是 `AgentRuntime`：Atrex 已支持 Claude、Qoder、Codex 和 Pi，但它们的 command、environment、token、authentication 与 skill-hydration 行为混杂在 `orchestrator/optimize.py` 中。
 
 这里指仓库级 multi-runtime support，而不是 multi-Agent orchestration。每个 campaign 在创建 workspace 时选择且只选择一个 runtime。该 campaign 的 setup、framework baseline、所有 optimization iteration、repair/salvage、conversion 和 finalization 始终使用同一个已记录 runtime。Runtime failure 绝不会触发自动 backend 切换；更换 backend 必须创建新的 campaign/workspace。
 
@@ -29,7 +29,7 @@ Atrex 需要更清晰的 harness，但更大的 harness 不会自动带来更好
 
 1. 将当前 Agent-driven optimization loop 作为行为基线。
 2. 在改变 authority model 之前先收集证据。
-3. 行为保持地抽取 `AgentRuntime`，因为三个真实 backend 已经证明该 seam 成立。
+3. 行为保持地抽取 `AgentRuntime`，因为四个真实 backend 已经证明该 seam 成立。
 4. 每个 campaign workspace 在完整生命周期内绑定一个 runtime；iteration 或 recovery turn 之间绝不自动切换 backend。
 5. 为普通 optimization iteration 增加 local-only、read-only observability，不改变 Git 或 memory authority。
 6. 只有 acceptance uncertainty 能证明需要时，才增加 shadow decision observation。
@@ -55,7 +55,7 @@ Atrex 需要更清晰的 harness，但更大的 harness 不会自动带来更好
 
 ### Optimization Agent
 
-Optimization Agent 是通过 Claude、Qoder 或 Codex 运行的 model-driven actor。它目前负责：
+Optimization Agent 是通过 Claude、Qoder、Codex 或 Pi 运行的 model-driven actor。它目前负责：
 
 - 读取历史 memory 和 profile evidence；
 - 查询 gpu-wiki 与 reference source；
@@ -112,9 +112,9 @@ Harness 变更可以提升 reliability、observability、recovery、consistency 
 
 ## 当前证据
 
-### 已确认：三个真实 Agent runtime 耦合在同一模块
+### 已确认：四个真实 Agent runtime 耦合在同一模块
 
-Atrex 支持 Claude、Qoder 和 Codex。Host-specific 行为当前分布在：
+Atrex 支持 Claude、Qoder、Codex 和 Pi。Host-specific 行为当前分布在：
 
 - `_session_command`；
 - `_session_env`；
@@ -200,7 +200,7 @@ Extraction 或 enforcement 改变它之前，必须先完成 baseline characteri
 
 | Class | 含义 |
 | --- | --- |
-| `runtime_failure` | Claude/Qoder/Codex process 未完成 contract |
+| `runtime_failure` | Claude/Qoder/Codex/Pi process 未完成 contract |
 | `candidate_validation_failure` | Candidate compile、correctness 或 admissibility check 失败 |
 | `performance_rejection` | Candidate 合法，但没有显著提升 incumbent |
 | `infrastructure_failure` | Gateway/provider 无法产生可信 observation |
@@ -244,7 +244,7 @@ Extraction 或 enforcement 改变它之前，必须先完成 baseline characteri
 
 ### 为什么现在已经合理
 
-已经存在三个真实 backend。一个 adapter 只是 hypothetical seam；三个 adapter 证明 host variation 真实存在。
+已经存在四个真实 backend。一个 adapter 只是 hypothetical seam；四个 adapter 证明 host variation 真实存在。
 
 ### 最小 interface
 
@@ -348,8 +348,8 @@ Shared process supervision 和 dependency guard 可以放在 runtime internal mo
 
 ### Success criteria
 
-- `Campaign` 不再为 session execution 根据 Claude/Qoder/Codex 分支；
-- 三个 adapter 通过共享 contract suite；
+- `Campaign` 不再为 session execution 根据 Claude/Qoder/Codex/Pi 分支；
+- 四个 adapter 通过共享 contract suite；
 - 同一个 campaign 的所有 path 使用其 recorded runtime，mismatched resume 在启动 Agent session 前失败；
 - 现有 CLI 与 campaign test 保持通过；
 - 除测试噪声外，不预期 token/GPU/wall-time 变化；
@@ -534,7 +534,7 @@ Percentage 使用 non-overlapping top-level phase wall time 除以 total iterati
 - 完整、重复、缺失、嵌套、重叠和未闭合的 token marker interval；
 - normalized usage delta、terminal usage、backend capability unavailable 和 inconsistent reconciliation；
 - 一个 `vN` 下多个 attempt，包括缺少 terminal usage 的 attempt；
-- Claude/Qoder/Codex source 与 token-event normalization；
+- Claude/Qoder/Codex/Pi source 与 token-event normalization；
 - sandbox retry/fallback duration 且不重复计数；
 - source-path sanitization 与 private-data rejection；
 - memory/Git disagreement 输出 `unknown`；
@@ -783,7 +783,7 @@ Harness mechanism 只有在目标 reliability metric 提升、同时 optimizatio
 
 ### PR 1 — runtime characterization
 
-- 固定当前 Claude/Qoder/Codex 的 command、environment、token、failure、process-guard 与 hydration 行为；
+- 固定当前 Claude/Qoder/Codex/Pi 的 command、environment、token、failure、process-guard 与 hydration 行为；
 - 识别现有 private test 中哪些是权威语义，哪些只是偶然实现；
 - 使用 public-safe evidence 记录当前 backend failure category；
 - 不改变 campaign authority 或 prompt。
@@ -791,7 +791,7 @@ Harness mechanism 只有在目标 reliability metric 提升、同时 optimizatio
 ### PR 2 — AgentRuntime extraction
 
 - 引入最小 `AgentRuntime.run()` seam；
-- 将真实 host variation 移到 Claude/Qoder/Codex adapter 后；
+- 将真实 host variation 移到 Claude/Qoder/Codex/Pi adapter 后；
 - 将一个 selected runtime 注入 campaign 的所有 path；
 - 持久化并强制 campaign-level runtime binding，同时兼容 legacy adoption；
 - 保持所有当前行为和 artifact；
@@ -826,7 +826,7 @@ Harness mechanism 只有在目标 reliability metric 提升、同时 optimizatio
 如果证据最终支持更深控制，保持以下 responsibility direction：
 
 - **Optimization Agent：** evidence interpretation、research、planning、candidate generation、debugging；
-- **AgentRuntime：** Claude/Qoder/Codex host adaptation；
+- **AgentRuntime：** Claude/Qoder/Codex/Pi host adaptation；
 - **GPU transport/evaluator：** bounded profile 与 evaluation observation；
 - **domain policy：** 根据 observation 产生 typed decision；
 - **workspace/Git module：** candidate 与 commit mechanics；
@@ -868,7 +868,7 @@ Harness mechanism 只有在目标 reliability metric 提升、同时 optimizatio
 
 ### 在 production incident 前完全不做架构变更
 
-拒绝。现有三个 backend 已经证明 runtime seam 存在，而且提前 characterization 的成本低于高代价 incident。
+拒绝。现有四个 backend 已经证明 runtime seam 存在，而且提前 characterization 的成本低于高代价 incident。
 
 ### 只因为 `optimize.py` 很大就重构
 
@@ -887,7 +887,7 @@ Harness mechanism 只有在目标 reliability metric 提升、同时 optimizatio
 | 风险 | 缓解措施 |
 | --- | --- |
 | Evidence collection 变成新的大型 observability 项目 | 只收集与近期决策绑定的 metric；无法获取时记录 unknown |
-| AgentRuntime extraction 变成推测性 plugin framework | 只实现三个当前 adapter 和一个最小 interface |
+| AgentRuntime extraction 变成推测性 plugin framework | 只实现四个当前 adapter 和一个最小 interface |
 | Shadow check 静默变成 authority | 保持 diagnostic output，禁止 Git/memory/stall write |
 | Problem-driven work 退化成局部 patch | 强制 owner、reproduction、success metric、rollback 和 stop condition |
 | 低频但严重 failure 被 frequency metric 忽略 | 一次高严重度 false accept 或不可恢复 corruption 即可成为充分证据 |

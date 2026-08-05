@@ -15,7 +15,7 @@ This RFC adopts a problem-driven strategy:
 
 > Observe a real failure or repeated change cost, reproduce it, measure it, introduce the smallest mechanism that owns it, and stop when the measured problem is solved.
 
-The only architectural extraction currently justified by multiple real implementations is `AgentRuntime`: Atrex already supports Claude, Qoder, and Codex, while their command, environment, token, authentication, and skill-hydration behavior is mixed into `orchestrator/optimize.py`.
+The only architectural extraction currently justified by multiple real implementations is `AgentRuntime`: Atrex already supports Claude, Qoder, Codex, and Pi, while their command, environment, token, authentication, and skill-hydration behavior is mixed into `orchestrator/optimize.py`.
 
 This is repository-level multi-runtime support, not multi-Agent orchestration. Each campaign selects exactly one runtime when its workspace is created. Setup, framework baseline, every optimization iteration, repair/salvage, conversion, and finalization for that campaign use the same recorded runtime. Runtime failure never causes an automatic backend switch; changing backend requires a new campaign/workspace.
 
@@ -29,7 +29,7 @@ All broader mechanisms are conditional. Controller-owned acceptance, candidate w
 
 1. Treat the current Agent-driven optimization loop as the behavioral baseline.
 2. Collect evidence before changing its authority model.
-3. Extract `AgentRuntime` behavior-preservingly because three real backends already justify that seam.
+3. Extract `AgentRuntime` behavior-preservingly because four real backends already justify that seam.
 4. Bind each campaign workspace to one runtime for its full lifecycle; never switch backend automatically between iterations or recovery turns.
 5. Add local-only, read-only observability for ordinary optimization iterations without changing Git or memory authority.
 6. Add shadow decision observation only when acceptance uncertainty justifies it.
@@ -112,9 +112,9 @@ Behavior-preserving extraction and behavior-changing enforcement remain separate
 
 ## Current evidence
 
-### Confirmed: three real Agent runtimes are coupled to one module
+### Confirmed: four real Agent runtimes are coupled to one module
 
-Atrex supports Claude, Qoder, and Codex. Host-specific behavior currently spans functions such as:
+Atrex supports Claude, Qoder, Codex, and Pi. Host-specific behavior currently spans functions such as:
 
 - `_session_command`;
 - `_session_env`;
@@ -200,7 +200,7 @@ Classify observations without collapsing them into one “failure” bucket:
 
 | Class | Meaning |
 | --- | --- |
-| `runtime_failure` | Claude/Qoder/Codex process did not complete its contract |
+| `runtime_failure` | Claude/Qoder/Codex/Pi process did not complete its contract |
 | `candidate_validation_failure` | Candidate compile, correctness, or admissibility check failed |
 | `performance_rejection` | Candidate was valid but did not significantly improve the incumbent |
 | `infrastructure_failure` | Gateway/provider could not produce a trustworthy observation |
@@ -244,7 +244,7 @@ If no material harness problem is found, stop after the justified `AgentRuntime`
 
 ### Why this stage is justified now
 
-There are already three real backends. One adapter means a hypothetical seam; three adapters make host variation real.
+There are already four real backends. One adapter means a hypothetical seam; four adapters make host variation real.
 
 ### Minimal interface
 
@@ -348,8 +348,8 @@ Characterize current commands, environment, token parsing, failures, hydration, 
 
 ### Success criteria
 
-- `Campaign` no longer branches on Claude/Qoder/Codex for session execution;
-- all three adapters pass a shared contract suite;
+- `Campaign` no longer branches on Claude/Qoder/Codex/Pi for session execution;
+- all four adapters pass a shared contract suite;
 - every path in one campaign uses its recorded runtime, and mismatched resume fails before launching an Agent session;
 - existing CLI and campaign tests remain green;
 - no token/GPU/wall-time change is expected beyond test noise;
@@ -534,7 +534,7 @@ Use fake clocks and fixture streams to cover:
 - complete, repeated, missing, nested, overlapping, and unclosed token marker intervals;
 - normalized usage deltas, terminal usage, unavailable backend capability, and inconsistent reconciliation;
 - multiple attempts under one `vN`, including attempts without terminal usage;
-- Claude/Qoder/Codex source and token-event normalization;
+- Claude/Qoder/Codex/Pi source and token-event normalization;
 - sandbox retry/fallback duration without double counting;
 - source-path sanitization and private-data rejection;
 - memory/Git disagreement producing `unknown`;
@@ -783,7 +783,7 @@ Add this problem-driven plan in English and Chinese. No runtime behavior changes
 
 ### PR 1 — runtime characterization
 
-- pin current Claude/Qoder/Codex command, environment, token, failure, process-guard, and hydration behavior;
+- pin current Claude/Qoder/Codex/Pi command, environment, token, failure, process-guard, and hydration behavior;
 - identify which existing private tests are authoritative and which are incidental;
 - record current backend failure categories using public-safe evidence;
 - do not change campaign authority or prompts.
@@ -791,7 +791,7 @@ Add this problem-driven plan in English and Chinese. No runtime behavior changes
 ### PR 2 — AgentRuntime extraction
 
 - introduce the minimal `AgentRuntime.run()` seam;
-- move concrete host variation behind Claude/Qoder/Codex adapters;
+- move concrete host variation behind Claude/Qoder/Codex/Pi adapters;
 - inject one selected runtime into all paths of a campaign;
 - persist and enforce the campaign-level runtime binding with legacy adoption;
 - keep all current behavior and artifacts;
@@ -826,7 +826,7 @@ There is no pre-approved PR 3–12 sequence.
 If evidence eventually justifies deeper control, preserve this responsibility direction:
 
 - **Optimization Agent:** evidence interpretation, research, planning, candidate generation, debugging;
-- **AgentRuntime:** Claude/Qoder/Codex host adaptation;
+- **AgentRuntime:** Claude/Qoder/Codex/Pi host adaptation;
 - **GPU transport/evaluator:** bounded profile and evaluation observations;
 - **domain policy:** typed decisions from observations;
 - **workspace/Git module:** candidate and commit mechanics;
@@ -887,7 +887,7 @@ Rejected. LoopX may govern a coarse Atrex campaign later, but it does not provid
 | Risk | Mitigation |
 | --- | --- |
 | Evidence collection becomes a new broad observability project | Collect only metrics tied to an imminent decision; record unknowns |
-| AgentRuntime extraction becomes a speculative plugin framework | Implement only the three current adapters and one minimal interface |
+| AgentRuntime extraction becomes a speculative plugin framework | Implement only the four current adapters and one minimal interface |
 | Shadow checks silently become authority | Keep outputs diagnostic and prohibit Git/memory/stall writes |
 | Problem-driven work degenerates into local patches | Require owner, reproduction, success metric, rollback, and stop condition |
 | Severe but rare failures are ignored by frequency metrics | Treat one high-severity false accept or unrecoverable corruption as sufficient evidence |

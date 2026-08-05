@@ -4,12 +4,14 @@ import json
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from orchestrator import optimize
 from orchestrator.agent_runtime import (
     AgentRuntimeCapabilities,
     NormalizedAgentEvent,
+    PiAdapter,
     TokenUsage,
 )
 from orchestrator.telemetry import (
@@ -50,6 +52,32 @@ DELTA_CAPABILITIES = AgentRuntimeCapabilities(
 
 
 class PhaseTokenSummaryTest(unittest.TestCase):
+    def test_pi_usage_and_receipts_feed_the_common_phase_summary(self) -> None:
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "agent_runtime"
+            / "pi_usage.jsonl"
+        )
+        adapter = PiAdapter(Path("missing"))
+        events, terminal = adapter.normalize_stream(fixture.read_text())
+
+        summary = summarize_phase_tokens(
+            events=events,
+            terminal_usage=terminal,
+            capabilities=replace(
+                adapter.capabilities, usage_delta_observed=True
+            ),
+            observation_errors=(),
+        )
+
+        self.assertEqual(
+            summary["phases"]["research"]["usage"]["total_tokens"], 109
+        )
+        self.assertEqual(summary["terminal_usage"]["total_tokens"], 326)
+        self.assertEqual(summary["unattributed"]["total_tokens"], 217)
+        self.assertEqual(summary["reconciliation_status"], "reconciled")
+
     def test_complete_non_overlapping_intervals_are_attributed_and_reconciled(self) -> None:
         events = (
             NormalizedAgentEvent(0, "usage_delta", usage=usage(2)),
