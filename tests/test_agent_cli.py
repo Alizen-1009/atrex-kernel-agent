@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +12,18 @@ from orchestrator import optimize
 
 
 class AgentCliTest(unittest.TestCase):
+    def test_optimize_help_supports_direct_script_execution(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, "orchestrator/optimize.py", "--help"],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--agent-cli", completed.stdout)
+
     def test_codex_and_pi_are_supported_backends(self) -> None:
         self.assertIn("codex", optimize.AGENT_CLI_CHOICES)
         self.assertIn("pi", optimize.AGENT_CLI_CHOICES)
@@ -166,6 +180,8 @@ class AgentCliTest(unittest.TestCase):
         self.assertEqual(env["ATREX_SANDBOX_URL"], "https://gateway.example.test")
         self.assertEqual(env["ATREX_SANDBOX_TIMEOUT"], "456")
         self.assertEqual(result.tokens, 9)
+        self.assertEqual(result.terminal_usage.total_tokens, 9)
+        self.assertEqual([event.kind for event in result.events], ["terminal_usage"])
 
     def test_pi_transcript_is_located_in_configured_session_directory(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pi-sessions-") as temp_dir:

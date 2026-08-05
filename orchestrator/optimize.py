@@ -82,6 +82,7 @@ from typing import Callable, Optional
 try:
     from . import agent_runtime as _agent_runtime
     from .aggregate_dispatch import embed_bucket_sources
+    from .telemetry import IterationTelemetryRecorder, changed_paths_since
     from .optimization_policy import (
         OPTIMIZATION_MODE_CHOICES,
         install_workspace_policy,
@@ -93,6 +94,10 @@ try:
 except ImportError:  # direct script execution: python orchestrator/optimize.py
     import agent_runtime as _agent_runtime  # type: ignore[no-redef]
     from aggregate_dispatch import embed_bucket_sources  # type: ignore[no-redef]
+    from telemetry import (  # type: ignore[no-redef]
+        IterationTelemetryRecorder,
+        changed_paths_since,
+    )
     from optimization_policy import (  # type: ignore[no-redef]
         OPTIMIZATION_MODE_CHOICES,
         install_workspace_policy,
@@ -475,6 +480,10 @@ class SessionResult:
     stdout_tail: str
     stderr_tail: str
     session_id: str = ""
+    terminal_usage: _agent_runtime.TokenUsage | None = None
+    events: tuple[_agent_runtime.NormalizedAgentEvent, ...] = ()
+    capabilities: _agent_runtime.AgentRuntimeCapabilities | None = None
+    observation_errors: tuple[str, ...] = ()
 
 
 def _render(template_path: Path, **kw: str) -> str:
@@ -662,6 +671,7 @@ def run_session(
     sandbox_url: str = "",
     sandbox_timeout: int = DEFAULT_SANDBOX_TIMEOUT,
     reasoning_effort: str = "max",
+    extra_environment: Optional[dict[str, str]] = None,
 ) -> SessionResult:
     """Run one clean coding-agent session with no conversational memory from prior iterations."""
     session_id = str(uuid.uuid4())
@@ -681,6 +691,7 @@ def run_session(
             sandbox_url=sandbox_url,
             sandbox_timeout_s=sandbox_timeout,
             session_id=session_id,
+            extra_environment=extra_environment,
         )
     )
     return SessionResult(
@@ -690,6 +701,10 @@ def run_session(
         stdout_tail=result.stdout_tail,
         stderr_tail=result.stderr_tail,
         session_id=result.session_id,
+        terminal_usage=result.terminal_usage,
+        events=result.events,
+        capabilities=result.capabilities,
+        observation_errors=result.observation_errors,
     )
 
 
@@ -2561,6 +2576,53 @@ class Campaign:
                 flush=True,
             )
 
+    def _begin_iteration_telemetry(
+        self, n: int, pre_head: str
+    ) -> Optional[IterationTelemetryRecorder]:
+        try:
+            recorder = IterationTelemetryRecorder(
+                workspace=self.workspace,
+                campaign_id=self.campaign_name,
+                version=n,
+                runtime_id=self.agent_cli,
+                base_head=pre_head,
+                base_kernel_blob=git_kernel_blob(self.workspace),
+                monotonic_clock=time.monotonic,
+                utc_clock=lambda: datetime.now(timezone.utc).isoformat(),
+                attempt_id=str(uuid.uuid4()),
+            )
+            recorder.agent_started()
+            return recorder
+        except Exception as exc:
+            print(
+                f"[orchestrator] WARNING: could not start telemetry for v{n}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+
+    def _finish_iteration_telemetry(
+        self,
+        recorder: Optional[IterationTelemetryRecorder],
+        n: int,
+        memory: Optional[dict],
+    ) -> None:
+        if recorder is None:
+            return
+        try:
+            recorder.finalize(
+                memory=memory,
+                post_head=git_head(self.workspace),
+                post_kernel_blob=git_kernel_blob(self.workspace),
+                changed_paths=changed_paths_since(self.workspace, recorder.base_head),
+            )
+        except Exception as exc:
+            print(
+                f"[orchestrator] WARNING: could not finalize telemetry for v{n}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
     def run(self) -> str:
         if latest_version(self.workspace) < 0:
             self.setup_baseline()
@@ -2649,6 +2711,9 @@ class Campaign:
             previous_latency = incumbent_latency(self.workspace, n)
             pre_head_was_gluon = head_kernel_is_gluon(self.workspace)
             pre_head = git_head(self.workspace)  # win = a commit that changes kernel.py vs this
+            telemetry = (
+                None if do_convert else self._begin_iteration_telemetry(n, pre_head)
+            )
             res = run_session(
                 self.workspace, prompt, timeout=self.iter_timeout,
                 agent_cli=self.agent_cli,
@@ -2656,8 +2721,27 @@ class Campaign:
                 sandbox_profile=self.sandbox_profile,
                 sandbox_url=self.sandbox_url,
                 sandbox_timeout=self.sandbox_timeout,
+                extra_environment=(telemetry.environment() if telemetry else None),
             )
             self._account(res, f"{'convert' if do_convert else 'iter'} v{n}")
+            if telemetry is not None:
+                try:
+                    telemetry.agent_completed(
+                        session_id=res.session_id,
+                        exit_status=res.exit_status,
+                        timed_out=res.timed_out,
+                        terminal_usage=res.terminal_usage,
+                        events=res.events,
+                        capabilities=res.capabilities,
+                        observation_errors=res.observation_errors,
+                    )
+                except Exception as exc:
+                    print(
+                        f"[orchestrator] WARNING: could not record telemetry attempt v{n}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    telemetry = None
 
             # Robust infra-failure handling: distinguish crash vs timeout, retry up to 15
             # consecutive failures with progressive backoff before giving up. A 2-fail
@@ -2681,6 +2765,9 @@ class Campaign:
                 # no memory, and an empty version forces the next session to re-derive everything.
                 self._ensure_iteration_memory(n, res, "convert" if do_convert else "iter")
                 if infra_fails >= 15:
+                    self._finish_iteration_telemetry(
+                        telemetry, n, read_memory(self.workspace, n)
+                    )
                     if do_convert:
                         raise RuntimeError(
                             "mandatory Triton->Gluon conversion could not complete after "
@@ -2713,6 +2800,8 @@ class Campaign:
                     )
                     mem = read_memory(self.workspace, n)
                     won = False
+            if not do_convert:
+                self._finish_iteration_telemetry(telemetry, n, mem)
             if do_convert:
                 # A direct triton->gluon translation must preserve BOTH correctness and performance.
                 # Accept only a committed gluon kernel whose geomean is within +CONVERT_PERF_TOL of the

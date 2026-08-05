@@ -45,6 +45,28 @@ through `tools/sandbox.py`.
 This prompt is **self-contained** — it defines all stages (1–4), commit/revert rules, and record format.
 Evidence format throughout: `evidence -> inference -> action`. Do Stages 1–4 once, then commit/revert/record and exit.
 
+## Local iteration telemetry
+
+When `ATREX_TELEMETRY_TRACE` is present, mark phase boundaries with the local helper. Telemetry is best-effort and must never replace or block optimization work:
+
+```bash
+python tools/iteration_trace.py phase-start <profile|research|planning|implementation|correctness|benchmark|recording>
+python tools/iteration_trace.py phase-end <profile|research|planning|implementation|correctness|benchmark|recording>
+```
+
+Map the work as follows: start `research` as the first standalone tool call before reading history or sources; Stage 1 profiling is `profile`; source investigation in Step A or Stage 2 is `research`; selecting and documenting the one lever in Stage 2 is `planning`; Stage 3 is `implementation`; correctness checks in Stage 4 are `correctness`; final performance measurement in Stage 4 is `benchmark`; and all acceptance/revert, memory, Git, and handoff work in Steps C–D is `recording`.
+
+Use complete marker pairs around the corresponding work below. Execute `phase-start research` before any history read or other work. Execute each `phase-start` marker as a standalone tool call and wait for its receipt before issuing that phase's work; execute `phase-end` only after the work completes. Minimize gaps by starting the next phase immediately after ending the previous phase. At most one phase may be active at a time: end the current phase before starting another. A phase may be entered again later with a new complete pair. Missing, unclosed, nested, or overlapping markers are left unattributed rather than guessed. Before or immediately after reading a relevant source, record only its metadata (never its contents):
+
+```bash
+python tools/iteration_trace.py source-read gpu_wiki <workspace-relative-path>
+python tools/iteration_trace.py source-read reference_projects <workspace-relative-path>
+python tools/iteration_trace.py source-read workspace <workspace-relative-path>
+python tools/iteration_trace.py source-read public_web <sanitized-public-reference>
+```
+
+Do not record credentials, private URL parameters, absolute user paths, raw tool output, or transcript text. Before Step C, start `recording`; keep it active through acceptance/revert, memory updates, Git operations, and final checks, then end it as the last tool action before the final response. If the helper is unavailable or returns an error, continue the optimization normally and leave telemetry coverage partial.
+
 ## Step A — Learn from prior sessions (read; do not redo their work)
 
 1. Read `README.md` — the **Goal** (minimize the geomean of per-workload kernel latency), config (platform, target framework, `gpu_wiki_path`), and the ground-truth files. There are no pre-baked Stop Conditions — the orchestrator owns termination; your job is to cut the geomean latency this cycle while keeping every workload correct.
