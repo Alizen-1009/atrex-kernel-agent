@@ -11,15 +11,26 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 PHASES = {"profile", "research", "planning", "implementation", "correctness", "benchmark"}
 SOURCE_KINDS = {"gpu_wiki", "reference_projects", "workspace", "public_web", "unknown"}
 
 
-def _safe_ref(value: str) -> str:
+def _safe_ref(value: str, *, source_kind: str) -> str:
     value = value.strip().replace("\\", "/")
+    if source_kind == "public_web":
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("public source reference must be a credential-free HTTP URL")
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))[:500]
     if not value or value.startswith("/") or ".." in Path(value).parts:
-        raise ValueError("source reference must be a safe relative/public reference")
+        raise ValueError("source reference must be a safe relative reference")
     return value[:500]
 
 
@@ -82,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
         append_event(
             "source_read",
             source_kind=args.source_kind,
-            reference=_safe_ref(args.reference),
+            reference=_safe_ref(args.reference, source_kind=args.source_kind),
         )
     return 0
 

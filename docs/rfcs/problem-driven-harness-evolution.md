@@ -293,7 +293,7 @@ Concrete adapters own only host variation that exists today:
 - host-specific skill/plugin hydration;
 - host-specific diagnostic classification.
 
-Shared process supervision and dependency guards may live in a runtime-internal module. Campaign logic receives an `AgentRuntime` and does not branch on host names.
+Shared process supervision and dependency guards may live in a runtime-internal module. Campaign state persists one immutable runtime id; the session boundary resolves that id through the runtime registry and does not branch on host names. Runtime-instance injection is not required for v1.
 
 ### Implementations
 
@@ -454,12 +454,12 @@ Token attribution uses a stricter model than time attribution:
 - phase intervals may repeat but may not overlap;
 - only complete, matching, non-overlapping explicit marker pairs are eligible;
 - the marker helper emits a machine-readable receipt only after the trace write succeeds;
-- backend adapters normalize message usage as `usage_delta` and final session usage as `terminal_usage`;
+- backend adapters normalize message usage as `usage_delta` and final session usage as `terminal_usage`; parser capability alone is not evidence, so a session with no observed delta remains unavailable;
 - missing, malformed, nested, or unclosed intervals are never inferred from tool behavior;
 - unassigned token usage remains in an explicit `unattributed` bucket;
 - input token usage belongs to the phase in which the model processed it, even when the context originated in an earlier phase;
 - input, output, cache-read, cache-write, and total counters remain separate; missing backend fields are `null`, not zero;
-- if usage deltas exceed terminal usage, retain the conflict as `inconsistent` rather than scaling phase values;
+- if usage deltas exceed terminal usage in total or in any mutually available component, retain the conflict as `inconsistent` rather than clamping or scaling phase values;
 - if a backend exposes only terminal usage, phase values are `unavailable`, coverage is zero, and the full total is unattributed.
 
 Phase attribution is attempt-first and iteration-second. Failed and timed-out attempts remain in the aggregate. This telemetry is diagnostic only and does not replace the existing `result.tokens` compatibility total used by campaign token budgets.
@@ -480,23 +480,15 @@ A sandbox call may be nested inside a phase. Its duration does not add a second 
 
 ### Metadata-only source trace
 
-Normalize source-read events inside each AgentRuntime adapter where the backend stream exposes tool calls. Classify sources as:
+v1 source metadata is an explicit best-effort Agent marker, not an automatic reconstruction of backend tool traffic. Classify marked sources as:
 
 ```text
 gpu_wiki | reference_projects | workspace | public_web | unknown
 ```
 
-Record only:
+Record only source kind plus a workspace-relative path or sanitized public reference. Summaries may derive count, unique count, and repeats from those markers. Public references retain only credential-free HTTP(S) scheme, authority, and path; query parameters, fragments, and URL userinfo are discarded or rejected.
 
-- source kind;
-- workspace-relative path or sanitized public reference;
-- allowlisted query tool and sanitized search keywords;
-- operation duration and status;
-- repeated-read count.
-
-Do not record file contents, raw tool output, full transcripts, unrestricted shell commands, credentials, user absolute paths, or private URL parameters. If a backend cannot expose all reads, mark `source_read_coverage=partial`.
-
-Tool duration measures I/O/tool execution, not model comprehension. The wider research phase contains model reasoning time.
+Do not record file contents, raw tool output, full transcripts, unrestricted shell commands, credentials, user absolute paths, or private URL parameters. The absence of a marker yields `source_read_coverage=unavailable`; v1 does not claim that every read was observed.
 
 ### Read-only outcome normalization
 
@@ -862,6 +854,7 @@ This plan does not pre-authorize:
 - dynamic runtime switching or cross-runtime handoff inside one campaign;
 - tracked raw telemetry, remote telemetry infrastructure, or dashboards;
 - inferred or time-proportional phase token estimates, token-price/currency accounting, or phase token attribution for non-ordinary sessions; existing campaign token-budget accounting remains unchanged;
+- automatic recovery of every source read from backend tool streams;
 - observability for non-ordinary phases before v1 is evaluated;
 - per-step worktrees.
 

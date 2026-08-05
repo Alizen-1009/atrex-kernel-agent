@@ -14,6 +14,7 @@ from orchestrator.agent_runtime import (
 )
 from orchestrator.telemetry import (
     IterationTelemetryRecorder,
+    aggregate_attempt_tokens,
     changed_paths_since,
     observed_outcome,
     summarize_phase_tokens,
@@ -44,6 +45,7 @@ DELTA_CAPABILITIES = AgentRuntimeCapabilities(
     terminal_usage=True,
     usage_delta=True,
     phase_marker_receipt=True,
+    usage_delta_observed=True,
 )
 
 
@@ -61,7 +63,7 @@ class PhaseTokenSummaryTest(unittest.TestCase):
 
         summary = summarize_phase_tokens(
             events=events,
-            terminal_usage=usage(40),
+            terminal_usage=TokenUsage(37, 3, None, None, 40, "exact"),
             capabilities=DELTA_CAPABILITIES,
             observation_errors=(),
         )
@@ -85,7 +87,7 @@ class PhaseTokenSummaryTest(unittest.TestCase):
 
         summary = summarize_phase_tokens(
             events=events,
-            terminal_usage=usage(7),
+            terminal_usage=TokenUsage(5, 2, None, None, 7, "exact"),
             capabilities=DELTA_CAPABILITIES,
             observation_errors=(),
         )
@@ -108,7 +110,7 @@ class PhaseTokenSummaryTest(unittest.TestCase):
 
         summary = summarize_phase_tokens(
             events=events,
-            terminal_usage=usage(12),
+            terminal_usage=TokenUsage(9, 3, None, None, 12, "exact"),
             capabilities=DELTA_CAPABILITIES,
             observation_errors=(),
         )
@@ -118,6 +120,28 @@ class PhaseTokenSummaryTest(unittest.TestCase):
         self.assertEqual(summary["unattributed"]["total_tokens"], 12)
         self.assertIn("overlapping_phase", summary["reason_codes"])
         self.assertIn("unclosed_phase", summary["reason_codes"])
+
+    def test_component_delta_above_terminal_is_inconsistent(self) -> None:
+        events = (
+            NormalizedAgentEvent(0, "phase_marker", phase="research", action="start", marker_id="m1"),
+            NormalizedAgentEvent(
+                1,
+                "usage_delta",
+                usage=TokenUsage(12, 0, None, None, 12, "exact"),
+            ),
+            NormalizedAgentEvent(2, "phase_marker", phase="research", action="end", marker_id="m2"),
+        )
+
+        summary = summarize_phase_tokens(
+            events=events,
+            terminal_usage=TokenUsage(10, 5, None, None, 15, "exact"),
+            capabilities=DELTA_CAPABILITIES,
+            observation_errors=(),
+        )
+
+        self.assertEqual(summary["reconciliation_status"], "inconsistent")
+        self.assertIsNone(summary["unattributed"])
+        self.assertIn("usage_delta_exceeds_terminal", summary["reason_codes"])
 
     def test_delta_total_above_terminal_is_reported_without_correction(self) -> None:
         events = (
@@ -161,7 +185,7 @@ class PhaseTokenSummaryTest(unittest.TestCase):
             observation_errors=(),
         )
 
-        aggregate = telemetry_iteration._aggregate_attempt_tokens(
+        aggregate = aggregate_attempt_tokens(
             [
                 {"phase_tokens": missing_terminal},
                 {"phase_tokens": observed_terminal},
@@ -174,6 +198,22 @@ class PhaseTokenSummaryTest(unittest.TestCase):
         self.assertEqual(aggregate["coverage"], 0.5)
         self.assertEqual(aggregate["unattributed"]["total_tokens"], 10)
         self.assertIn("attempt_terminal_usage_unavailable", aggregate["reason_codes"])
+
+    def test_supported_but_unobserved_deltas_do_not_become_exact_zero(self) -> None:
+        summary = summarize_phase_tokens(
+            events=(
+                NormalizedAgentEvent(0, "phase_marker", phase="research", action="start", marker_id="m1"),
+                NormalizedAgentEvent(1, "phase_marker", phase="research", action="end", marker_id="m2"),
+            ),
+            terminal_usage=usage(9),
+            capabilities=AgentRuntimeCapabilities(True, True, True, False),
+            observation_errors=(),
+        )
+
+        self.assertIsNone(summary["phases"]["research"]["usage"])
+        self.assertEqual(summary["unattributed"]["total_tokens"], 9)
+        self.assertEqual(summary["coverage"], 0.0)
+        self.assertIn("backend_usage_delta_unobserved", summary["reason_codes"])
 
     def test_backend_without_delta_capability_attributes_nothing(self) -> None:
         summary = summarize_phase_tokens(
@@ -190,6 +230,22 @@ class PhaseTokenSummaryTest(unittest.TestCase):
 
 
 class IterationTelemetryTest(unittest.TestCase):
+    def test_phase_timing_rejects_overlap_and_keeps_time_unattributed(self) -> None:
+        events = [
+            {"event": "phase_started", "phase": "research", "monotonic_seconds": 1.0},
+            {"event": "phase_started", "phase": "implementation", "monotonic_seconds": 2.0},
+            {"event": "phase_completed", "phase": "implementation", "monotonic_seconds": 3.0},
+            {"event": "phase_completed", "phase": "research", "monotonic_seconds": 4.0},
+        ]
+
+        phases, _, _, timing = telemetry_iteration._summarize_events(events, 10.0)
+
+        self.assertIsNone(phases["research"]["wall_seconds"])
+        self.assertIsNone(phases["implementation"]["wall_seconds"])
+        self.assertEqual(timing["attributed_seconds"], 0.0)
+        self.assertEqual(timing["unattributed_seconds"], 10.0)
+        self.assertIn("overlapping_phase", timing["reason_codes"])
+
     def _recorder(
         self,
         workspace: Path,
@@ -588,6 +644,8 @@ class IterationTelemetryTest(unittest.TestCase):
         self.assertNotIn("tokens", summary)
         self.assertEqual(summary["phases"]["research"]["measurement"], "explicit")
         self.assertEqual(summary["phases"]["research"]["wall_seconds"], 2.0)
+        self.assertEqual(summary["phase_timing"]["attributed_seconds"], 2.0)
+        self.assertEqual(summary["unattributed_wall_seconds"], 13.0)
         self.assertEqual(summary["source_reads"]["coverage"], "explicit")
         self.assertEqual(summary["source_reads"]["unique_count"], 1)
         self.assertEqual(summary["sandbox_operations"]["coverage"], "exact")

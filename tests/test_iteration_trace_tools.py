@@ -8,10 +8,14 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from orchestrator.telemetry.phase_tokens import PHASES as TELEMETRY_PHASES
 from tools import iteration_trace, sandbox
 
 
 class IterationTraceToolTest(unittest.TestCase):
+    def test_tool_and_telemetry_share_the_same_phase_contract(self) -> None:
+        self.assertEqual(iteration_trace.PHASES, set(TELEMETRY_PHASES))
+
     def test_phase_and_source_commands_append_metadata_only_events(self) -> None:
         with tempfile.TemporaryDirectory(prefix="trace-tool-") as temp_dir:
             trace = Path(temp_dir) / "trace.jsonl"
@@ -64,8 +68,21 @@ class IterationTraceToolTest(unittest.TestCase):
     def test_source_command_rejects_absolute_or_parent_paths(self) -> None:
         for reference in ("/absolute/private/file", "../private/file"):
             with self.subTest(reference=reference):
-                with self.assertRaisesRegex(ValueError, "safe relative/public reference"):
+                with self.assertRaisesRegex(ValueError, "safe relative reference"):
                     iteration_trace.main(["source-read", "workspace", reference])
+
+    def test_public_source_strips_query_fragment_and_rejects_userinfo(self) -> None:
+        sanitized = iteration_trace._safe_ref(
+            "https://example.test/docs/page?credential=sensitive#private",
+            source_kind="public_web",
+        )
+
+        self.assertEqual(sanitized, "https://example.test/docs/page")
+        with self.assertRaisesRegex(ValueError, "credential-free HTTP URL"):
+            iteration_trace._safe_ref(
+                "https://user:password@example.test/docs",
+                source_kind="public_web",
+            )
 
     def test_sandbox_wrapper_records_operation_without_changing_execution(self) -> None:
         with tempfile.TemporaryDirectory(prefix="sandbox-trace-") as temp_dir:

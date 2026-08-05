@@ -23,20 +23,17 @@ except ImportError:  # direct script execution: python orchestrator/optimize.py
         TokenUsage,
     )
 
+from .phase_tokens import (
+    PHASES,
+    aggregate_attempt_tokens,
+    summarize_phase_tokens,
+    usage_dict,
+)
+
 
 EVENT_SCHEMA_VERSION = "atrex_iteration_event_v1"
 SUMMARY_SCHEMA_VERSION = "atrex_iteration_summary_v2"
 TELEMETRY_ROOT = Path(".atrex") / "telemetry"
-PHASES = (
-    "profile",
-    "research",
-    "planning",
-    "implementation",
-    "correctness",
-    "benchmark",
-)
-
-
 def observed_outcome(
     *,
     exit_status: int,
@@ -97,443 +94,73 @@ def changed_paths_since(workspace: Path, base_head: str) -> list[str]:
     return sorted(changed)
 
 
-def _usage_dict(usage: TokenUsage) -> dict[str, Any]:
-    return {
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "cache_read_tokens": usage.cache_read_tokens,
-        "cache_write_tokens": usage.cache_write_tokens,
-        "total_tokens": usage.total_tokens,
-        "measurement": usage.measurement,
-    }
-
-
-def _sum_usages(usages: Sequence[TokenUsage]) -> TokenUsage:
-    if not usages:
-        return TokenUsage(0, 0, 0, 0, 0, "exact")
-
-    def component(name: str) -> int | None:
-        values = [getattr(usage, name) for usage in usages]
-        if any(value is None for value in values):
-            return None
-        return sum(int(value) for value in values if value is not None)
-
-    totals = [usage.total_tokens for usage in usages]
-    return TokenUsage(
-        input_tokens=component("input_tokens"),
-        output_tokens=component("output_tokens"),
-        cache_read_tokens=component("cache_read_tokens"),
-        cache_write_tokens=component("cache_write_tokens"),
-        total_tokens=(
-            sum(int(value) for value in totals if value is not None)
-            if all(value is not None for value in totals)
-            else None
-        ),
-        measurement=(
-            "exact"
-            if all(usage.measurement == "exact" for usage in usages)
-            else "partial"
-        ),
-    )
-
-
-def _subtract_usage(total: TokenUsage, attributed: TokenUsage) -> TokenUsage:
-    def component(name: str) -> int | None:
-        left = getattr(total, name)
-        right = getattr(attributed, name)
-        if left is None or right is None:
-            return None
-        return max(0, int(left) - int(right))
-
-    return TokenUsage(
-        input_tokens=component("input_tokens"),
-        output_tokens=component("output_tokens"),
-        cache_read_tokens=component("cache_read_tokens"),
-        cache_write_tokens=component("cache_write_tokens"),
-        total_tokens=component("total_tokens"),
-        measurement=(
-            "exact"
-            if total.measurement == "exact" and attributed.measurement == "exact"
-            else "partial"
-        ),
-    )
-
-
-def summarize_phase_tokens(
-    *,
-    events: Sequence[NormalizedAgentEvent],
-    terminal_usage: TokenUsage,
-    capabilities: AgentRuntimeCapabilities,
-    observation_errors: Sequence[str],
-) -> dict[str, Any]:
-    """Attribute normalized usage deltas only to complete explicit phase pairs."""
-    phase_intervals: dict[str, list[list[TokenUsage]]] = {
-        phase: [] for phase in PHASES
-    }
-    reason_codes = list(observation_errors)
-    all_deltas: list[TokenUsage] = []
-    active_phase: str | None = None
-    active_usage: list[TokenUsage] = []
-    invalid_stack: list[str] = []
-
-    if not capabilities.usage_delta:
-        reason_codes.append("backend_has_no_usage_delta")
-        return {
-            "terminal_usage": _usage_dict(terminal_usage),
-            "phases": {
-                phase: {
-                    "usage": None,
-                    "interval_count": 0,
-                    "measurement": "unavailable",
-                    "reason": "phase_not_observed",
-                }
-                for phase in PHASES
-            },
-            "unattributed": (
-                _usage_dict(terminal_usage)
-                if terminal_usage.total_tokens is not None
-                else None
-            ),
-            "coverage": (
-                0.0 if terminal_usage.total_tokens is not None else None
-            ),
-            "measurement": "unavailable",
-            "reconciliation_status": (
-                "reconciled"
-                if terminal_usage.total_tokens is not None
-                else "unavailable"
-            ),
-            "reason_codes": sorted(set(reason_codes)),
-        }
-
-    for event in events:
-        if event.kind == "usage_delta" and event.usage is not None:
-            all_deltas.append(event.usage)
-            if active_phase is not None and not invalid_stack:
-                active_usage.append(event.usage)
-            continue
-        if event.kind != "phase_marker":
-            continue
-        phase = event.phase or ""
-        action = event.action
-        if phase not in phase_intervals or action not in {"start", "end"}:
-            reason_codes.append("invalid_phase_marker")
-            continue
-
-        if invalid_stack:
-            if action == "start":
-                invalid_stack.append(phase)
-                reason_codes.append("overlapping_phase")
-            elif invalid_stack and phase == invalid_stack[-1]:
-                invalid_stack.pop()
-            elif phase in invalid_stack:
-                reason_codes.append("mismatched_phase_end")
-                while invalid_stack and invalid_stack[-1] != phase:
-                    invalid_stack.pop()
-                if invalid_stack:
-                    invalid_stack.pop()
-            else:
-                reason_codes.append("orphan_phase_end")
-            continue
-
-        if action == "start":
-            if active_phase is None:
-                active_phase = phase
-                active_usage = []
-            else:
-                reason_codes.append("overlapping_phase")
-                invalid_stack = [active_phase, phase]
-                active_phase = None
-                active_usage = []
-            continue
-
-        if active_phase is None:
-            reason_codes.append("orphan_phase_end")
-        elif active_phase == phase:
-            phase_intervals[phase].append(active_usage)
-            active_phase = None
-            active_usage = []
-        else:
-            reason_codes.append("mismatched_phase_end")
-            invalid_stack = [active_phase]
-            active_phase = None
-            active_usage = []
-
-    if active_phase is not None or invalid_stack:
-        reason_codes.append("unclosed_phase")
-
-    phase_payload: dict[str, Any] = {}
-    attributed_usages: list[TokenUsage] = []
-    for phase, intervals in phase_intervals.items():
-        if not intervals:
-            phase_payload[phase] = {
-                "usage": None,
-                "interval_count": 0,
-                "measurement": "unavailable",
-                "reason": "phase_not_observed",
-            }
-            continue
-        interval_usages = [_sum_usages(interval) for interval in intervals]
-        phase_usage = _sum_usages(interval_usages)
-        attributed_usages.append(phase_usage)
-        phase_payload[phase] = {
-            "usage": _usage_dict(phase_usage),
-            "interval_count": len(intervals),
-            "measurement": phase_usage.measurement,
-            "reason": None,
-        }
-
-    attributed = _sum_usages(attributed_usages)
-    observed_delta = _sum_usages(all_deltas)
-    terminal_total = terminal_usage.total_tokens
-    attributed_total = attributed.total_tokens
-    observed_delta_total = observed_delta.total_tokens
-    if terminal_total is None:
-        unattributed = (
-            _subtract_usage(observed_delta, attributed)
-            if observed_delta_total is not None
-            and attributed_total is not None
-            and observed_delta_total >= attributed_total
-            else None
-        )
-        coverage = None
-        reconciliation = "unavailable"
-        measurement = "partial" if attributed_usages else "unavailable"
-        reason_codes.append("terminal_usage_unavailable")
-    elif (
-        attributed_total is None
-        or observed_delta_total is None
-        or attributed_total > terminal_total
-        or observed_delta_total > terminal_total
-    ):
-        unattributed = None
-        coverage = None
-        reconciliation = "inconsistent"
-        measurement = "partial"
-        reason_codes.append("usage_delta_exceeds_terminal")
-    else:
-        unattributed = _subtract_usage(terminal_usage, attributed)
-        coverage = (
-            round(attributed_total / terminal_total, 6)
-            if terminal_total > 0
-            else (1.0 if attributed_total == 0 else None)
-        )
-        reconciliation = "reconciled"
-        measurement = (
-            "exact"
-            if coverage == 1.0
-            and not reason_codes
-            and terminal_usage.measurement == "exact"
-            and attributed.measurement == "exact"
-            else ("partial" if attributed_usages else "unavailable")
-        )
-
-    return {
-        "terminal_usage": _usage_dict(terminal_usage),
-        "phases": phase_payload,
-        "unattributed": _usage_dict(unattributed) if unattributed else None,
-        "coverage": coverage,
-        "measurement": measurement,
-        "reconciliation_status": reconciliation,
-        "reason_codes": sorted(set(reason_codes)),
-    }
-
-
-def _usage_from_dict(payload: object) -> TokenUsage:
-    if not isinstance(payload, Mapping):
-        return TokenUsage.unavailable()
-
-    def value(name: str) -> int | None:
-        item = payload.get(name)
-        return int(item) if isinstance(item, int) and not isinstance(item, bool) else None
-
-    measurement = payload.get("measurement")
-    return TokenUsage(
-        input_tokens=value("input_tokens"),
-        output_tokens=value("output_tokens"),
-        cache_read_tokens=value("cache_read_tokens"),
-        cache_write_tokens=value("cache_write_tokens"),
-        total_tokens=value("total_tokens"),
-        measurement=(
-            str(measurement)
-            if measurement in {"exact", "partial", "unavailable"}
-            else "unavailable"
-        ),
-    )
-
-
-def _aggregate_attempt_tokens(attempts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    token_summaries = [
-        attempt.get("phase_tokens")
-        for attempt in attempts
-        if isinstance(attempt.get("phase_tokens"), Mapping)
-    ]
-    terminal_usages = [
-        _usage_from_dict(summary.get("terminal_usage"))
-        for summary in token_summaries
-    ]
-    observed_terminal = [
-        usage for usage in terminal_usages if usage.total_tokens is not None
-    ]
-    terminal = (
-        _sum_usages(observed_terminal)
-        if observed_terminal
-        else TokenUsage.unavailable()
-    )
-    if len(observed_terminal) != len(attempts) and terminal.total_tokens is not None:
-        terminal = TokenUsage(
-            terminal.input_tokens,
-            terminal.output_tokens,
-            terminal.cache_read_tokens,
-            terminal.cache_write_tokens,
-            terminal.total_tokens,
-            "partial",
-        )
-
-    phases: dict[str, Any] = {}
-    phase_aggregates: list[TokenUsage] = []
-    for phase in PHASES:
-        usages: list[TokenUsage] = []
-        interval_count = 0
-        unavailable_attempt = False
-        for summary in token_summaries:
-            phase_payload = summary.get("phases")
-            value = (
-                phase_payload.get(phase)
-                if isinstance(phase_payload, Mapping)
-                else None
-            )
-            if not isinstance(value, Mapping) or value.get("usage") is None:
-                unavailable_attempt = True
-                continue
-            phase_usage = _usage_from_dict(value.get("usage"))
-            if phase_usage.total_tokens is None:
-                unavailable_attempt = True
-                continue
-            usages.append(phase_usage)
-            count = value.get("interval_count")
-            if isinstance(count, int) and not isinstance(count, bool):
-                interval_count += count
-        if not usages:
-            phases[phase] = {
-                "usage": None,
-                "interval_count": 0,
-                "measurement": "unavailable",
-                "reason": "phase_not_observed",
-            }
-            continue
-        aggregate = _sum_usages(usages)
-        if unavailable_attempt:
-            aggregate = TokenUsage(
-                aggregate.input_tokens,
-                aggregate.output_tokens,
-                aggregate.cache_read_tokens,
-                aggregate.cache_write_tokens,
-                aggregate.total_tokens,
-                "partial",
-            )
-        phase_aggregates.append(aggregate)
-        phases[phase] = {
-            "usage": _usage_dict(aggregate),
-            "interval_count": interval_count,
-            "measurement": aggregate.measurement,
-            "reason": None,
-        }
-
-    displayed_attributed = _sum_usages(phase_aggregates)
-    displayed_attributed_total = displayed_attributed.total_tokens or 0
-    reasons = {
-        str(reason)
-        for summary in token_summaries
-        for reason in (summary.get("reason_codes") or [])
-    }
-    attempts_with_terminal = len(observed_terminal)
-    if attempts_with_terminal != len(attempts):
-        reasons.add("attempt_terminal_usage_unavailable")
-
-    coverage_attributed_total = 0
-    observed_unattributed: list[TokenUsage] = []
-    reconciliation_values: set[str] = set()
-    for summary in token_summaries:
-        attempt_terminal = _usage_from_dict(summary.get("terminal_usage"))
-        if attempt_terminal.total_tokens is None:
-            continue
-        reconciliation_values.add(str(summary.get("reconciliation_status")))
-        phase_payload = summary.get("phases")
-        if isinstance(phase_payload, Mapping):
-            for phase in PHASES:
-                value = phase_payload.get(phase)
-                if not isinstance(value, Mapping):
-                    continue
-                phase_usage = _usage_from_dict(value.get("usage"))
-                coverage_attributed_total += phase_usage.total_tokens or 0
-        attempt_unattributed = _usage_from_dict(summary.get("unattributed"))
-        if attempt_unattributed.total_tokens is not None:
-            observed_unattributed.append(attempt_unattributed)
-
-    if "inconsistent" in reconciliation_values:
-        reconciliation = "inconsistent"
-        unattributed = None
-        coverage = None
-    elif terminal.total_tokens is None:
-        reconciliation = "unavailable"
-        unattributed = None
-        coverage = None
-    elif coverage_attributed_total > terminal.total_tokens:
-        reconciliation = "inconsistent"
-        unattributed = None
-        coverage = None
-        reasons.add("usage_delta_exceeds_terminal")
-    else:
-        reconciliation = "reconciled"
-        unattributed = _sum_usages(observed_unattributed)
-        coverage = (
-            round(coverage_attributed_total / terminal.total_tokens, 6)
-            if terminal.total_tokens > 0
-            else (1.0 if coverage_attributed_total == 0 else None)
-        )
-
-    measurement = (
-        "exact"
-        if coverage == 1.0
-        and attempts_with_terminal == len(attempts)
-        and terminal.measurement == "exact"
-        and not reasons
-        else ("partial" if displayed_attributed_total else "unavailable")
-    )
-    reasons = sorted(reasons)
-    return {
-        "terminal_usage": _usage_dict(terminal),
-        "phases": phases,
-        "unattributed": _usage_dict(unattributed) if unattributed else None,
-        "coverage": coverage,
-        "measurement": measurement,
-        "reconciliation_status": reconciliation,
-        "reason_codes": reasons,
-        "attempts_with_terminal_usage": attempts_with_terminal,
-        "attempt_count": len(attempts),
-    }
-
-
 def _summarize_events(
     events: Sequence[Mapping[str, Any]], total_seconds: float
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    starts: dict[str, list[float]] = {phase: [] for phase in PHASES}
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     durations: dict[str, float] = {phase: 0.0 for phase in PHASES}
-    measurements: dict[str, str] = {phase: "unavailable" for phase in PHASES}
+    interval_counts: dict[str, int] = {phase: 0 for phase in PHASES}
+    invalid_phases: set[str] = set()
+    timing_reasons: set[str] = set()
+    active_phase: str | None = None
+    active_started = 0.0
+    invalid_stack: list[str] = []
     sources: list[dict[str, Any]] = []
     sandbox: list[dict[str, Any]] = []
+
     for event in events:
         kind = event.get("event")
         phase = str(event.get("phase") or "")
         stamp = event.get("monotonic_seconds")
-        if kind == "phase_started" and phase in starts and isinstance(stamp, (int, float)):
-            starts[phase].append(float(stamp))
-        elif kind == "phase_completed" and phase in starts and isinstance(stamp, (int, float)):
-            if starts[phase]:
-                durations[phase] += max(0.0, float(stamp) - starts[phase].pop())
-                measurements[phase] = str(event.get("measurement") or "explicit")
-        elif kind == "source_read":
+        if kind in {"phase_started", "phase_completed"}:
+            if phase not in durations or not isinstance(stamp, (int, float)):
+                timing_reasons.add("invalid_phase_marker")
+                continue
+            action = "start" if kind == "phase_started" else "end"
+            stamp = float(stamp)
+            if invalid_stack:
+                invalid_phases.add(phase)
+                if action == "start":
+                    invalid_stack.append(phase)
+                    timing_reasons.add("overlapping_phase")
+                elif phase == invalid_stack[-1]:
+                    invalid_stack.pop()
+                elif phase in invalid_stack:
+                    timing_reasons.add("mismatched_phase_end")
+                    while invalid_stack and invalid_stack[-1] != phase:
+                        invalid_stack.pop()
+                    if invalid_stack:
+                        invalid_stack.pop()
+                else:
+                    timing_reasons.add("orphan_phase_end")
+                continue
+            if action == "start":
+                if active_phase is None:
+                    active_phase = phase
+                    active_started = stamp
+                else:
+                    invalid_phases.update({active_phase, phase})
+                    timing_reasons.add("overlapping_phase")
+                    invalid_stack = [active_phase, phase]
+                    active_phase = None
+                continue
+            if active_phase is None:
+                invalid_phases.add(phase)
+                timing_reasons.add("orphan_phase_end")
+            elif active_phase != phase:
+                invalid_phases.update({active_phase, phase})
+                timing_reasons.add("mismatched_phase_end")
+                invalid_stack = [active_phase]
+                active_phase = None
+            elif stamp < active_started:
+                invalid_phases.add(phase)
+                timing_reasons.add("negative_phase_duration")
+                active_phase = None
+            else:
+                durations[phase] += stamp - active_started
+                interval_counts[phase] += 1
+                active_phase = None
+            continue
+        if kind == "source_read":
             sources.append(
                 {
                     "source_kind": event.get("source_kind") or "unknown",
@@ -556,17 +183,51 @@ def _summarize_events(
                     if event.get(key) is not None
                 }
             )
-    phases = {
-        phase: {
-            "wall_seconds": round(durations[phase], 6) if measurements[phase] != "unavailable" else None,
+
+    if active_phase is not None:
+        invalid_phases.add(active_phase)
+        timing_reasons.add("unclosed_phase")
+    if invalid_stack:
+        invalid_phases.update(invalid_stack)
+        timing_reasons.add("unclosed_phase")
+
+    phases: dict[str, Any] = {}
+    for phase in PHASES:
+        count = interval_counts[phase]
+        measurement = (
+            "partial"
+            if count and phase in invalid_phases
+            else ("explicit" if count else "unavailable")
+        )
+        phases[phase] = {
+            "wall_seconds": round(durations[phase], 6) if count else None,
             "percentage": (
                 round(durations[phase] / total_seconds * 100.0, 3)
-                if measurements[phase] != "unavailable" and total_seconds > 0
+                if count and total_seconds > 0
                 else None
             ),
-            "measurement": measurements[phase],
+            "interval_count": count,
+            "measurement": measurement,
         }
-        for phase in PHASES
+
+    attributed_seconds = sum(durations.values())
+    if attributed_seconds > total_seconds:
+        timing_reasons.add("phase_time_exceeds_iteration")
+    unattributed_seconds = max(0.0, total_seconds - attributed_seconds)
+    timing_summary = {
+        "attributed_seconds": round(attributed_seconds, 6),
+        "unattributed_seconds": round(unattributed_seconds, 6),
+        "coverage": (
+            round(attributed_seconds / total_seconds, 6)
+            if total_seconds > 0
+            else None
+        ),
+        "measurement": (
+            "partial"
+            if timing_reasons
+            else ("explicit" if any(interval_counts.values()) else "unavailable")
+        ),
+        "reason_codes": sorted(timing_reasons),
     }
     source_summary = {
         "coverage": "explicit" if sources else "unavailable",
@@ -583,7 +244,7 @@ def _summarize_events(
         ),
         "items": sandbox,
     }
-    return phases, source_summary, sandbox_summary
+    return phases, source_summary, sandbox_summary, timing_summary
 
 
 def _safe_id(value: str, *, fallback: str) -> str:
@@ -835,7 +496,7 @@ class IterationTelemetryRecorder:
         for runtime_event in events:
             fields: dict[str, Any] = {"sequence": runtime_event.sequence}
             if runtime_event.usage is not None:
-                fields["usage"] = _usage_dict(runtime_event.usage)
+                fields["usage"] = usage_dict(runtime_event.usage)
             if runtime_event.phase is not None:
                 fields["phase"] = runtime_event.phase
             if runtime_event.action is not None:
@@ -935,7 +596,7 @@ class IterationTelemetryRecorder:
         ):
             attempt_summaries.append(attempt)
         attempt_summaries.sort(key=lambda value: str(value.get("attempt_id") or ""))
-        phase_tokens = _aggregate_attempt_tokens(attempt_summaries)
+        phase_tokens = aggregate_attempt_tokens(attempt_summaries)
         agent_seconds = attempt["agent_wall_seconds"]
         events = [
             value
@@ -944,7 +605,7 @@ class IterationTelemetryRecorder:
             for value in [json.loads(line)]
             if isinstance(value, dict)
         ]
-        phases, source_reads, sandbox_operations = _summarize_events(
+        phases, source_reads, sandbox_operations, phase_timing = _summarize_events(
             events, total_seconds
         )
         summary = {
@@ -968,6 +629,7 @@ class IterationTelemetryRecorder:
             },
             "source_reads": source_reads,
             "sandbox_operations": sandbox_operations,
+            "phase_timing": phase_timing,
             "phase_tokens": phase_tokens,
             "runtime": dict(self._runtime),
             "git": {
@@ -986,20 +648,12 @@ class IterationTelemetryRecorder:
             "observed_outcome": outcome,
             "reason_codes": reasons,
             "coverage": {
-                "phase_timing": (
-                    "explicit"
-                    if any(value["measurement"] != "unavailable" for value in phases.values())
-                    else "partial"
-                ),
+                "phase_timing": phase_timing["measurement"],
                 "source_reads": source_reads["coverage"],
                 "sandbox_operations": sandbox_operations["coverage"],
                 "phase_tokens": phase_tokens["measurement"],
             },
-            "unattributed_wall_seconds": (
-                round(max(0.0, total_seconds - agent_seconds), 6)
-                if agent_seconds is not None
-                else total_seconds
-            ),
+            "unattributed_wall_seconds": phase_timing["unattributed_seconds"],
         }
         _atomic_json(self.attempt_summary_path, attempt)
         _atomic_json(self.iteration_summary_path, summary)

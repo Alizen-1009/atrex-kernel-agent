@@ -293,7 +293,7 @@ Concrete adapter 只负责今天真实存在的 host variation：
 - host-specific skill/plugin hydration；
 - host-specific diagnostic classification。
 
-Shared process supervision 和 dependency guard 可以放在 runtime internal module。Campaign logic 只接收 `AgentRuntime`，不根据 host name 分支。
+Shared process supervision 和 dependency guard 可以放在 runtime internal module。Campaign state 持久化一个 immutable runtime id；session boundary 通过 runtime registry 解析该 id，不根据 host name 分支。v1 不要求注入长期存活的 Runtime instance。
 
 ### Implementation
 
@@ -454,12 +454,12 @@ Token attribution 使用比时间归因更严格的模型：
 - phase interval 可以重复，但不能重叠；
 - 只有完整匹配、非重叠的 explicit marker pair 才允许归因；
 - marker helper 只有在 trace 写入成功后才输出 machine-readable receipt；
-- backend adapter 将 message usage 归一化为 `usage_delta`，将 session 最终 usage 归一化为 `terminal_usage`；
+- backend adapter 将 message usage 归一化为 `usage_delta`，将 session 最终 usage 归一化为 `terminal_usage`；parser capability 本身不构成证据，本次 session 未观察到 delta 时仍为 unavailable；
 - 缺失、非法、嵌套或未闭合的 interval 不根据 tool behavior 推断；
 - 无法归因的 token 保留在显式 `unattributed` bucket；
 - input token 归属于模型实际处理它的 phase，即使 context 来自更早的 phase；
 - input、output、cache-read、cache-write 和 total counter 分开保留；backend 缺失字段为 `null`，不是零；
-- usage delta 超过 terminal usage 时保留 `inconsistent` 冲突，不按比例缩放 phase value；
+- usage delta 的 total 或任一双方可用 component 超过 terminal usage 时保留 `inconsistent` 冲突，不 clamp 或按比例缩放 phase value；
 - backend 只有 terminal usage 时，phase value 为 `unavailable`、coverage 为零，全部 total 进入 unattributed。
 
 Phase attribution 先按 attempt 计算，再在 iteration 层聚合。失败和超时 attempt 仍保留在 aggregate 中。该 telemetry 只用于 diagnostic，不替换现有 campaign token budget 使用的 `result.tokens` compatibility total。
@@ -480,23 +480,15 @@ Sandbox call 可以嵌套在 phase 内，其 duration 不会再次加到 total i
 
 ### Metadata-only source trace
 
-当 backend stream 暴露 tool call 时，由各 AgentRuntime adapter 归一化 source-read event。Source 分类为：
+v1 source metadata 使用 explicit best-effort Agent marker，不自动重建 backend tool traffic。标记的 source 分类为：
 
 ```text
 gpu_wiki | reference_projects | workspace | public_web | unknown
 ```
 
-只记录：
+只记录 source kind，以及 workspace-relative path 或 sanitized public reference。Summary 可以从 marker 派生 count、unique count 和 repeat。Public reference 只保留不含 credential 的 HTTP(S) scheme、authority 和 path；query parameter、fragment 与 URL userinfo 必须被删除或拒绝。
 
-- source kind；
-- workspace-relative path 或 sanitized public reference；
-- allowlisted query tool 和 sanitized search keyword；
-- operation duration 与 status；
-- repeated-read count。
-
-不记录 file content、raw tool output、full transcript、不受限制的 shell command、credential、用户绝对路径或 private URL parameter。若某 backend 无法暴露完整 read，标记 `source_read_coverage=partial`。
-
-Tool duration 测量 I/O/tool execution，不代表 model comprehension。更宽的 research phase 包含 model reasoning time。
+不记录 file content、raw tool output、full transcript、不受限制的 shell command、credential、用户绝对路径或 private URL parameter。没有 marker 时输出 `source_read_coverage=unavailable`；v1 不声称观察到了每一次 read。
 
 ### Read-only outcome normalization
 
@@ -862,6 +854,7 @@ Harness mechanism 只有在目标 reliability metric 提升、同时 optimizatio
 - 单个 campaign 内的 dynamic runtime switching 或 cross-runtime handoff；
 - tracked raw telemetry、remote telemetry infrastructure 或 dashboard；
 - inferred 或按时间比例计算的 phase token estimate、token-price/currency accounting，或 non-ordinary session 的 phase token attribution；现有 campaign token-budget accounting 保持不变；
+- 从 backend tool stream 自动恢复每一次 source read；
 - 在评估 v1 之前覆盖 non-ordinary phase 的 observability；
 - per-step worktree。
 
