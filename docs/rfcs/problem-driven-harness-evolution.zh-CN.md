@@ -19,6 +19,8 @@ Atrex 需要更清晰的 harness，但更大的 harness 不会自动带来更好
 
 这里指仓库级 multi-runtime support，而不是 multi-Agent orchestration。每个 campaign 在创建 workspace 时选择且只选择一个 runtime。该 campaign 的 setup、framework baseline、所有 optimization iteration、repair/salvage、conversion 和 finalization 始终使用同一个已记录 runtime。Runtime failure 绝不会触发自动 backend 切换；更换 backend 必须创建新的 campaign/workspace。
 
+上游 `main` 还包含 opt-in 的 `long_horizon` 入口，它拥有独立的 episode supervisor、journal、隔离 worktree、handoff recovery 和 ABBA verification。本 RFC 将该 package 视为已经存在的相邻执行模式，不删除或重新设计它。下文关于不向普通流程新增 Controller、journal 或额外 worktree lifecycle 的限制，只适用于本提案覆盖的普通 `orchestrator.optimize` loop，不适用于已经交付的 `long_horizon` package。
+
 第二个近期问题也已经明确：maintainer 目前无法可靠回答一个普通 optimization iteration 的时间花在哪里、读取了哪些 source、哪些 GPU operation 占主要耗时，以及 backend 报告的 token usage 如何分布在 explicit workflow phase 中。v1 observability 解决该问题，但不改变 candidate acceptance、Git、memory、现有 token-budget accounting 或 optimization loop。
 
 更广泛的机制全部是条件性的。Controller-owned acceptance、candidate write scope、repair turn、durable step journal、two-phase Git writeback、通用 `step()` interface，以及 bucket/layer 迁移，都必须有明确 activation condition，而不是预先确定的 PR 路线。
@@ -361,7 +363,7 @@ Extraction 完成后，只继续到已经批准的 ordinary-iteration observabil
 
 ### 范围
 
-v1 只覆盖普通 optimization version `vN`，不覆盖 setup baseline、framework baseline、conversion、decomposition、recombination 或 aggregate validation。只有 ordinary-iteration trace 证明有价值后，才考虑扩展其他 path。它还以 best-effort 方式，把 backend 报告的 token usage 归因到普通 iteration 的 explicit phase；缺少 message-level usage 的 backend 降级为 `unavailable`，且不改变 Agent session。
+v1 只覆盖普通 optimization version `vN`，不覆盖 setup baseline、framework baseline、conversion、decomposition、recombination、aggregate validation 或 `long_horizon` episode。只有 ordinary-iteration trace 证明有价值后，才考虑扩展其他 path。它还以 best-effort 方式，把 backend 报告的 token usage 归因到普通 iteration 的 explicit phase；缺少 message-level usage 的 backend 降级为 `unavailable`，且不改变 Agent session。
 
 Observability 是 read-only 的。它不决定 candidate acceptance、repair state、Git commit、memory content、stall 或下一步 campaign action。
 

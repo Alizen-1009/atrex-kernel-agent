@@ -19,6 +19,8 @@ The only architectural extraction currently justified by multiple real implement
 
 This is repository-level multi-runtime support, not multi-Agent orchestration. Each campaign selects exactly one runtime when its workspace is created. Setup, framework baseline, every optimization iteration, repair/salvage, conversion, and finalization for that campaign use the same recorded runtime. Runtime failure never causes an automatic backend switch; changing backend requires a new campaign/workspace.
 
+Upstream `main` also contains the opt-in `long_horizon` entry point, with its own episode supervisor, journal, isolated worktrees, handoff recovery, and ABBA verification. This RFC treats that package as an existing adjacent execution mode and does not remove or redesign it. Restrictions below on adding a Controller, journal, or additional worktree lifecycle apply to the ordinary `orchestrator.optimize` loop covered by this proposal, not to the already-shipped `long_horizon` package.
+
 A second near-term problem is now explicit: maintainers cannot reliably answer where one ordinary optimization iteration spent its time, which sources it read, which GPU operations dominated, or how backend-reported token usage was distributed across explicit workflow phases. v1 observability addresses that problem without changing candidate acceptance, Git, memory, token-budget accounting, or the optimization loop.
 
 All broader mechanisms are conditional. Controller-owned acceptance, candidate write scopes, repair turns, durable step journals, two-phase Git writeback, a common `step()` interface, and bucket/layer migration are options with explicit activation conditions—not a predetermined PR sequence.
@@ -361,7 +363,7 @@ After extraction, proceed only to the already-approved ordinary-iteration observ
 
 ### Scope
 
-v1 covers ordinary optimization versions `vN` only. It does not instrument setup baseline, framework baseline, conversion, decomposition, recombination, or aggregate validation. Those paths may be added later only after the ordinary-iteration trace proves useful. It also attributes backend-reported token usage to explicit ordinary-iteration phases on a best-effort basis; a backend without message-level usage degrades to `unavailable` without changing the Agent session.
+v1 covers ordinary optimization versions `vN` only. It does not instrument setup baseline, framework baseline, conversion, decomposition, recombination, aggregate validation, or `long_horizon` episodes. Those paths may be added later only after the ordinary-iteration trace proves useful. It also attributes backend-reported token usage to explicit ordinary-iteration phases on a best-effort basis; a backend without message-level usage degrades to `unavailable` without changing the Agent session.
 
 Observability is read-only. It does not decide candidate acceptance, repair state, Git commits, memory contents, stall, or the next campaign action.
 
