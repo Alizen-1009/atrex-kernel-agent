@@ -59,7 +59,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import ast
 import concurrent.futures
 import json
 import math
@@ -81,6 +80,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 try:
+    from . import agent_runtime as _agent_runtime
     from .aggregate_dispatch import embed_bucket_sources
     from .optimization_policy import (
         OPTIMIZATION_MODE_CHOICES,
@@ -91,6 +91,7 @@ try:
         source_uses_gluon,
     )
 except ImportError:  # direct script execution: python orchestrator/optimize.py
+    import agent_runtime as _agent_runtime  # type: ignore[no-redef]
     from aggregate_dispatch import embed_bucket_sources  # type: ignore[no-redef]
     from optimization_policy import (  # type: ignore[no-redef]
         OPTIMIZATION_MODE_CHOICES,
@@ -144,67 +145,22 @@ AGGREGATE_QUEUE_WAIT_GRACE = 14_400  # single-worker localhost queues are indepe
 INITIAL_AGGREGATION_MIN_ITERATIONS = 10
 DEFAULT_SANDBOX_TIMEOUT = 600
 MAX_SANDBOX_TIMEOUT = 600
-PYPI_MIRROR = "https://pypi.tuna.tsinghua.edu.cn/simple"
+PYPI_MIRROR = _agent_runtime.PYPI_MIRROR
 DEPENDENCY_GUARD_POLL_SECONDS = 0.25
-DEFAULT_PROTECTED_GATEWAY_SCREEN = "atrex-local-gateway"
-DEFAULT_PROTECTED_GATEWAY_STATE_NAME = "atrex-local-gateway"
+DEFAULT_PROTECTED_GATEWAY_SCREEN = _agent_runtime.DEFAULT_PROTECTED_GATEWAY_SCREEN
+DEFAULT_PROTECTED_GATEWAY_STATE_NAME = _agent_runtime.DEFAULT_PROTECTED_GATEWAY_STATE_NAME
 
 
 def _protected_gateway_identity(
     environment: dict[str, str] | None = None,
 ) -> tuple[str, str]:
-    """Resolve shared gateway protection targets without embedding host paths."""
-    values = os.environ if environment is None else environment
-    screen = values.get(
-        "ATREX_PROTECTED_GATEWAY_SCREEN", DEFAULT_PROTECTED_GATEWAY_SCREEN
-    )
-    state_dir = values.get("ATREX_PROTECTED_GATEWAY_STATE_DIR")
-    if not state_dir:
-        cache_home = values.get("XDG_CACHE_HOME")
-        cache_root = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"
-        state_dir = str(cache_root / DEFAULT_PROTECTED_GATEWAY_STATE_NAME)
-    return screen, state_dir
+    """Compatibility route to the extracted runtime process policy."""
+    return _agent_runtime.protected_gateway_identity(environment)
 
 
 def _python_import_roots(code: str, *, _depth: int = 0) -> set[str]:
-    """Return real imported top-level modules without matching strings/comments."""
-    try:
-        tree = ast.parse(code)
-    except (SyntaxError, ValueError, TypeError):
-        # Invalid ``python -c`` input cannot execute an import.  Do not turn a
-        # syntax error or a research-note string into a policy violation.
-        return set()
-
-    roots: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            roots.update(alias.name.split(".", 1)[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            roots.add(node.module.split(".", 1)[0])
-        elif isinstance(node, ast.Call) and node.args:
-            target: str | None = None
-            if isinstance(node.func, ast.Name) and node.func.id == "__import__":
-                target = "import"
-            elif (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "import_module"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "importlib"
-            ):
-                target = "import"
-            if target and isinstance(node.args[0], ast.Constant):
-                module = node.args[0].value
-                if isinstance(module, str) and module:
-                    roots.add(module.split(".", 1)[0])
-            if (
-                _depth < 2
-                and isinstance(node.func, ast.Name)
-                and node.func.id in {"exec", "eval"}
-                and isinstance(node.args[0], ast.Constant)
-                and isinstance(node.args[0].value, str)
-            ):
-                roots.update(_python_import_roots(node.args[0].value, _depth=_depth + 1))
-    return roots
+    """Compatibility route to the extracted runtime process policy."""
+    return _agent_runtime.python_import_roots(code, _depth=_depth)
 
 
 def _status_is(value: object, expected: str) -> bool:
@@ -532,502 +488,34 @@ def _render(template_path: Path, **kw: str) -> str:
 
 
 def _tokens_from_stream(stdout: str) -> int:
-    """Sum core token usage from a coding CLI's JSONL stdout.
-
-    Claude/Qoder emit a cumulative ``type=result`` event. Codex ``exec --json`` emits a
-    cumulative ``type=turn.completed`` event. Prefer either terminal event and fall back to
-    summing per-message usage. Codex's ``cached_input_tokens``,
-    ``cache_write_input_tokens``, and ``reasoning_output_tokens`` are diagnostic subsets of
-    input/output and therefore must not be added again. Never raises — budget accounting
-    degrades to max-iters if the stream is unparseable.
-    """
-    def _usage_tokens(u: dict) -> int:
-        if not isinstance(u, dict):
-            return 0
-        return int(
-            (u.get("input_tokens") or u.get("inputTokens") or 0)
-            + (u.get("output_tokens") or u.get("outputTokens") or 0)
-            + (u.get("cache_creation_input_tokens") or u.get("cacheCreationInputTokens") or 0)
-            + (u.get("cache_read_input_tokens") or u.get("cacheReadInputTokens") or 0)
-        )
-
-    def _model_usage_tokens(model_usage: dict) -> int:
-        if not isinstance(model_usage, dict):
-            return 0
-        return sum(_usage_tokens(usage) for usage in model_usage.values())
-
-    result_total = None
-    summed = 0
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line or line[0] != "{":
-            continue
-        try:
-            evt = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(evt, dict):
-            continue
-        if evt.get("type") in ("result", "turn.completed"):
-            usage_total = _usage_tokens(evt.get("usage"))
-            model_total = _model_usage_tokens(evt.get("modelUsage"))
-            result_total = usage_total or model_total
-        usage = evt.get("usage")
-        if usage is None and isinstance(evt.get("message"), dict):
-            usage = evt["message"].get("usage")
-        if isinstance(usage, dict):
-            summed += _usage_tokens(usage)
-    return result_total if result_total else summed
+    """Compatibility route to the extracted runtime token parser."""
+    return _agent_runtime.token_usage_from_stream(stdout)
 
 
 def _dependency_process_violation(argv: list[str]) -> Optional[str]:
-    """Describe a forbidden dependency build or host GPU action, if any.
-
-    Optimizer workspaces are intentionally immutable with respect to third-party
-    packages.  Coding sessions must also route kernel imports, evaluators,
-    profilers, and CUDA compilation through ``tools/sandbox.py``.  Gateway
-    workers are not descendants of the coding session, so rejecting compiler
-    descendants here does not block legitimate remote/local-gateway JIT.
-    """
-    if not argv:
-        return None
-
-    def command_segments(process_argv: list[str]) -> list[list[str]]:
-        tokens = process_argv
-        executable = Path(process_argv[0]).name.lower()
-        if executable in {"bash", "sh", "dash", "zsh", "ksh"}:
-            command_index = next(
-                (
-                    index + 1
-                    for index, value in enumerate(process_argv[:-1])
-                    if value.startswith("-") and "c" in value[1:]
-                ),
-                -1,
-            )
-            if command_index >= 0:
-                try:
-                    lexer = shlex.shlex(
-                        process_argv[command_index], posix=True, punctuation_chars=";&|"
-                    )
-                    lexer.whitespace_split = True
-                    tokens = list(lexer)
-                except ValueError:
-                    tokens = process_argv
-        segments: list[list[str]] = []
-        current: list[str] = []
-        for token in tokens:
-            if token and all(character in ";&|" for character in token):
-                if current:
-                    segments.append(current)
-                    current = []
-            else:
-                current.append(token)
-        if current:
-            segments.append(current)
-        # Claude's Bash tool commonly wraps the actual command in ``eval``.
-        # Expand that payload so a direct host command cannot hide behind the
-        # shell snapshot preamble.
-        expanded = list(segments)
-        for segment in segments:
-            tokens = unwrap(segment)
-            if tokens and Path(tokens[0]).name.lower() == "eval" and len(tokens) > 1:
-                expanded.extend(command_segments(["sh", "-c", " ".join(tokens[1:])]))
-        return expanded
-
-    def unwrap(segment: list[str]) -> list[str]:
-        result = list(segment)
-        while result and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", result[0]):
-            result.pop(0)
-        if result and Path(result[0]).name.lower() in {"env", "command"}:
-            result.pop(0)
-            while result and (result[0].startswith("-") or "=" in result[0]):
-                result.pop(0)
-        if result and Path(result[0]).name.lower() == "timeout":
-            result.pop(0)
-            while result and result[0].startswith("-"):
-                result.pop(0)
-            if result:
-                result.pop(0)
-        return result
-
-    def is_installer(segment: list[str]) -> bool:
-        tokens = unwrap(segment)
-        if not tokens:
-            return False
-        lowered = [token.lower() for token in tokens]
-        executable = Path(lowered[0]).name
-        if re.fullmatch(r"pip[0-9.]*", executable):
-            return len(lowered) > 1 and lowered[1] in {"install", "wheel"}
-        if executable == "uv":
-            return lowered[1:3] in (["pip", "install"], ["pip", "sync"], ["pip", "compile"])
-        if executable in {"conda", "mamba", "micromamba"}:
-            return len(lowered) > 1 and lowered[1] in {"install", "create"}
-        if re.fullmatch(r"python[0-9.]*", executable):
-            if len(lowered) > 3 and lowered[1:3] == ["-m", "pip"]:
-                return lowered[3] in {"install", "wheel"}
-            if len(lowered) > 2 and lowered[1:3] == ["-m", "build"]:
-                return True
-            for index, token in enumerate(lowered[:-1]):
-                if Path(token).name == "setup.py" and lowered[index + 1] in {
-                    "install", "build", "build_ext", "bdist_wheel",
-                }:
-                    return True
-            # tools/sandbox.py ... -- pip install must be rejected too: the
-            # immutable dependency rule applies on both sides of the gateway.
-            if "--" in lowered:
-                boundary = lowered.index("--")
-                return is_installer(tokens[boundary + 1 :])
-        if Path(executable).name == "setup.py":
-            return len(lowered) > 1 and lowered[1] in {
-                "install", "build", "build_ext", "bdist_wheel",
-            }
-        return False
-
-    segments = command_segments(argv)
-
-    def shared_gateway_mutation(segment: list[str]) -> bool:
-        """Reject coding-session lifecycle/state changes to shared localhost infra."""
-        tokens = unwrap(segment)
-        if not tokens:
-            return False
-        executable = Path(tokens[0]).name.lower()
-        lowered = [token.lower() for token in tokens]
-        protected_screen, protected_state = _protected_gateway_identity()
-        protected_screen = protected_screen.lower()
-        protected_state = protected_state.lower()
-
-        if executable == "screen" and any(
-            token == protected_screen or token.endswith("." + protected_screen)
-            for token in lowered[1:]
-        ):
-            return True
-        if executable in {"rm", "rmdir", "unlink", "shred", "truncate", "mv"} and any(
-            token == protected_state
-            or token.startswith(protected_state + "/")
-            or token == protected_state + ".log"
-            for token in lowered[1:]
-        ):
-            return True
-        if re.fullmatch(r"python[0-9.]*", executable):
-            if any(Path(token).name == "local_gateway.py" for token in tokens[1:3]):
-                return "serve" in lowered[1:]
-            if "-c" in tokens:
-                code_index = tokens.index("-c") + 1
-                code = tokens[code_index].lower() if code_index < len(tokens) else ""
-                if protected_state in code and re.search(
-                    r"(?:rmtree|unlink|remove|rename|replace|sqlite3)", code
-                ):
-                    return True
-        if executable in {"pkill", "killall"} and any(
-            "local_gateway" in token or token == protected_screen
-            for token in lowered[1:]
-        ):
-            return True
-        if executable in {"curl", "wget"} and any(
-            "/v1/jobs/" in token and "/cancel" in token for token in lowered[1:]
-        ):
-            return True
-        return False
-
-    if any(shared_gateway_mutation(segment) for segment in segments):
-        return "shared localhost gateway lifecycle/state mutation"
-
-    if any(is_installer(segment) for segment in segments):
-        return "third-party package installation/build command"
-
-    def direct_host_gpu_action(segment: list[str]) -> Optional[str]:
-        tokens = unwrap(segment)
-        if not tokens:
-            return None
-        lowered = [token.lower() for token in tokens]
-        executable = Path(lowered[0]).name
-        info_only = (
-            any(token in {"--help", "-h", "--version"} for token in lowered[1:])
-            or (executable == "nvcc" and "-V" in tokens[1:])
-        )
-        if executable in {"nvcc", "cicc", "ptxas", "fatbinary", "ninja"} and not info_only:
-            return "CUDA/JIT build tool executed directly on the host"
-        if executable in {"ncu", "rocprof", "rocprofv3", "compute-sanitizer"}:
-            return "GPU profiler executed directly on the host"
-        if re.fullmatch(r"python[0-9.]*", executable):
-            if len(tokens) > 1 and Path(tokens[1]).name == "sandbox.py":
-                return None
-            if len(tokens) > 1 and Path(tokens[1]).name in {
-                "kernel.py", "test_kernel.py", "profile_driver.py",
-            }:
-                return "kernel/evaluator executed directly on the host"
-            if "-c" in tokens:
-                code_index = tokens.index("-c") + 1
-                code = tokens[code_index] if code_index < len(tokens) else ""
-                imports = _python_import_roots(code)
-                if "kernel" in imports:
-                    return "kernel imported directly on the host"
-                if imports & {"flashinfer", "flash_attn", "xformers", "vllm"}:
-                    return "JIT-capable third-party GPU package imported directly on the host"
-        if executable in {"bash", "sh", "dash", "zsh", "ksh"} and any(
-            Path(token).name in {"profile_nvidia.sh", "profile_kernel.sh"}
-            for token in tokens[1:]
-        ):
-            return "GPU profiler wrapper executed directly on the host"
-        return None
-
-    for segment in segments:
-        reason = direct_host_gpu_action(segment)
-        if reason is not None:
-            return reason
-
-    command = " ".join(argv).lower()
-    package_build_tree = re.search(
-        r"(?:^|[\s=])[^\s]*(?:pip-install-|pip-build-|pip-modern-metadata-)[^\s]*",
-        command,
-    )
-    build_tools = {"cicc", "nvcc", "ninja", "cmake", "make", "gcc", "g++", "clang", "clang++"}
-    if package_build_tree and any(
-        unwrap(segment) and Path(unwrap(segment)[0]).name.lower() in build_tools
-        for segment in segments
-    ):
-        return "compiler/build tool running in a package-manager temporary tree"
-    return None
+    """Compatibility route to the extracted runtime process policy."""
+    return _agent_runtime.dependency_process_violation(argv)
 
 
-def _descendant_process_commands(root_pid: int) -> list[tuple[int, list[str]]]:
-    """Return live descendants and argv using Linux procfs, tolerating races.
-
-    Children created by ``subprocess.Popen`` inside a Python worker thread are
-    listed under that thread's ``task/<tid>/children``, not necessarily under
-    the thread-group leader. Inspect every task so bucket sessions launched by
-    ``ThreadPoolExecutor`` are included in shutdown and policy-guard snapshots.
-    """
-    pending = [root_pid]
-    seen = {root_pid}
-    descendants: list[tuple[int, list[str]]] = []
-    while pending:
-        parent = pending.pop()
-        task_dir = Path(f"/proc/{parent}/task")
-        try:
-            thread_dirs = list(task_dir.iterdir())
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
-            continue
-        children: set[int] = set()
-        for thread_dir in thread_dirs:
-            try:
-                children.update(
-                    int(value)
-                    for value in (thread_dir / "children").read_text().split()
-                )
-            except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
-                continue
-        for pid in children:
-            if pid in seen:
-                continue
-            seen.add(pid)
-            pending.append(pid)
-            try:
-                raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-            except (FileNotFoundError, PermissionError, ProcessLookupError):
-                continue
-            argv = [part.decode(errors="replace") for part in raw.split(b"\0") if part]
-            descendants.append((pid, argv))
-    return descendants
-
-
-def _descendant_process_groups(root_pid: int) -> set[int]:
-    """Capture every process group in a coding session's live process tree."""
-    process_groups: set[int] = set()
-    for pid in [root_pid, *[pid for pid, _argv in _descendant_process_commands(root_pid)]]:
-        try:
-            process_groups.add(os.getpgid(pid))
-        except ProcessLookupError:
-            pass
-    return process_groups
-
-
-def _signal_process_groups(process_groups: set[int], sig: signal.Signals) -> None:
-    for process_group in process_groups:
-        try:
-            os.killpg(process_group, sig)
-        except ProcessLookupError:
-            pass
-
-
-def _dependency_guard(
-    proc: subprocess.Popen[str], stop: threading.Event, violations: list[str]
-) -> None:
-    """Kill a coding session as soon as it starts a forbidden dependency job."""
-    while not stop.wait(DEPENDENCY_GUARD_POLL_SECONDS):
-        if proc.poll() is not None:
-            return
-        for pid, argv in _descendant_process_commands(proc.pid):
-            reason = _dependency_process_violation(argv)
-            if reason is None:
-                continue
-            rendered = " ".join(argv)
-            violations.append(f"pid={pid}: {reason}: {rendered[:1000]}")
-            process_groups = _descendant_process_groups(proc.pid)
-            _signal_process_groups(process_groups, signal.SIGTERM)
-            deadline = time.monotonic() + 1.0
-            while proc.poll() is None and time.monotonic() < deadline:
-                if stop.wait(0.05):
-                    return
-            # A Bash tool can call setsid and outlive the Claude process group.
-            # Always signal the captured child groups even when Claude already
-            # exited after SIGTERM.
-            _signal_process_groups(process_groups, signal.SIGKILL)
-            return
-
-
-def _run_bounded(cmd: list[str], cwd: Path, timeout: int, env: Optional[dict] = None) -> tuple[str, str, int, bool]:
-    """Run cmd in its own group with timeout and dependency-build enforcement."""
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,  # own process group -> killpg reaps grandchildren
-        env=env,
-    )
-    guard_stop = threading.Event()
-    dependency_violations: list[str] = []
-    guard = threading.Thread(
-        target=_dependency_guard,
-        args=(proc, guard_stop, dependency_violations),
-        name=f"dependency-guard-{proc.pid}",
-        daemon=True,
-    )
-    guard.start()
-    timed_out = False
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        process_groups = _descendant_process_groups(proc.pid)
-        _signal_process_groups(process_groups, signal.SIGKILL)
-        stdout, stderr = proc.communicate()
-    except BaseException:
-        # The coding CLI owns a separate process group. If an explicit or
-        # auto-dispatched optimizer is interrupted, reap that entire group so
-        # Qoder/Claude and their tool subprocesses cannot become orphaned.
-        process_groups = _descendant_process_groups(proc.pid)
-        _signal_process_groups(process_groups, signal.SIGTERM)
-        try:
-            proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            _signal_process_groups(process_groups, signal.SIGKILL)
-            proc.communicate()
-        raise
-    finally:
-        guard_stop.set()
-        guard.join(timeout=1)
-    returncode = proc.returncode
-    if dependency_violations:
-        policy_message = (
-            "[orchestrator] dependency policy violation; terminated coding session:\n"
-            + "\n".join(dependency_violations)
-        )
-        stderr = (stderr or "") + ("\n" if stderr else "") + policy_message + "\n"
-        if returncode == 0:
-            returncode = 126
-    return stdout or "", stderr or "", returncode, timed_out
-
+def _run_bounded(
+    cmd: list[str], cwd: Path, timeout: int, env: Optional[dict] = None
+) -> tuple[str, str, int, bool]:
+    """Compatibility route to the extracted runtime process supervisor."""
+    return _agent_runtime.run_bounded(cmd, cwd, timeout, env)
 
 def _session_env(agent_cli: str) -> dict:
-    """Build the environment for a nested coding-agent session.
-
-    Claude-specific auth normalization is deliberately not applied to Qoder CLI. When a Bearer
-    auth token is available for Claude (ANTHROPIC_AUTH_TOKEN — e.g. an Anthropic-compatible
-    gateway), drop ANTHROPIC_API_KEY so Claude authenticates via the token instead of sending
-    x-api-key, which such gateways reject with 401.
-    """
-    env = os.environ.copy()
-    # An optimizer launched via an absolute environment-Python path does not
-    # implicitly activate that environment for Claude/Qoder Bash tools. Make
-    # the orchestrator's own interpreter/toolchain the session default while
-    # retaining the rest of the caller PATH.
-    python_bin = str(Path(sys.executable).resolve().parent)
-    path_parts = [
-        part for part in env.get("PATH", "").split(os.pathsep)
-        if part and part != python_bin
-    ]
-    env["PATH"] = os.pathsep.join([python_bin, *path_parts])
-    # Defense in depth for python -m pip and short-lived installer processes that
-    # could race the process watchdog.  Sessions still may not install packages;
-    # binary-only ensures an attempted pip command cannot fall back to source.
-    env["PIP_ONLY_BINARY"] = ":all:"
-    env["PIP_INDEX_URL"] = PYPI_MIRROR
-    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
-    # Bash commands launched by a coding CLI source this guard before executing
-    # the tool payload. It prevents fast shared-gateway mutations before the
-    # procfs watchdog could observe them.
-    env["BASH_ENV"] = str(SESSION_SHELL_GUARD)
-    protected_screen, protected_state = _protected_gateway_identity(env)
-    env["ATREX_PROTECTED_GATEWAY_SCREEN"] = protected_screen
-    env["ATREX_PROTECTED_GATEWAY_STATE_DIR"] = protected_state
-    if agent_cli == "claude" and env.get("ANTHROPIC_AUTH_TOKEN"):
-        env.pop("ANTHROPIC_API_KEY", None)
-    return env
+    """Compatibility route to the extracted runtime environment builder."""
+    return _agent_runtime.build_session_environment(agent_cli)
 
 
 def _toml_config_value(value: object) -> str:
-    """Encode the JSON-compatible subset accepted by ``codex exec -c key=value``."""
-    if value is None or isinstance(value, dict):
-        raise ValueError("Codex config values must be strings, numbers, booleans, or arrays")
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError("Codex floating-point config values must be finite")
-    if isinstance(value, list):
-        if any(item is None or isinstance(item, (dict, list)) for item in value):
-            raise ValueError("Codex config arrays may contain only scalar values")
-        if any(isinstance(item, float) and not math.isfinite(item) for item in value):
-            raise ValueError("Codex floating-point config values must be finite")
-    if isinstance(value, (str, int, float, list)):
-        # JSON strings/scalars/scalar arrays are also valid TOML values.
-        return json.dumps(value, ensure_ascii=False)
-    raise ValueError(f"unsupported Codex config value type: {type(value).__name__}")
+    """Compatibility route to the extracted Codex settings encoder."""
+    return _agent_runtime.toml_config_value(value)
 
 
 def _codex_settings_args(raw: str) -> list[str]:
-    """Translate ATREX_CODEX_SESSION_SETTINGS into repeatable Codex ``-c`` flags.
-
-    Accepted forms are a JSON object (the convenient form) or a JSON array of literal
-    ``key=value`` strings (for values that need Codex-specific TOML syntax).
-    """
-    if not raw:
-        return []
-    try:
-        settings = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "ATREX_CODEX_SESSION_SETTINGS must be a JSON object or an array of key=value strings"
-        ) from exc
-
-    pairs: list[str] = []
-    if isinstance(settings, dict):
-        for key, value in settings.items():
-            if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", key):
-                raise ValueError(f"invalid Codex config key: {key!r}")
-            pairs.append(f"{key}={_toml_config_value(value)}")
-    elif isinstance(settings, list):
-        for item in settings:
-            if not isinstance(item, str) or "=" not in item or item.startswith("="):
-                raise ValueError(
-                    "ATREX_CODEX_SESSION_SETTINGS array entries must be key=value strings"
-                )
-            key = item.split("=", 1)[0]
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+", key):
-                raise ValueError(f"invalid Codex config key: {key!r}")
-            pairs.append(item)
-    else:
-        raise ValueError(
-            "ATREX_CODEX_SESSION_SETTINGS must be a JSON object or an array of key=value strings"
-        )
-
-    args: list[str] = []
-    for pair in pairs:
-        args += ["-c", pair]
-    return args
+    """Compatibility route to the extracted Codex settings parser."""
+    return _agent_runtime.codex_settings_args(raw)
 
 
 def _session_command(
@@ -1036,70 +524,19 @@ def _session_command(
     session_id: str,
     reasoning_effort: str = "max",
 ) -> list[str]:
-    """Return a non-interactive, fresh-session command for the selected coding CLI."""
-    if reasoning_effort not in {"low", "medium", "high", "max"}:
-        raise ValueError(f"unsupported reasoning effort: {reasoning_effort!r}")
-    if agent_cli == "claude":
-        cmd = [
-            "claude", "--print", "--verbose",
-            "--dangerously-skip-permissions",
-            "--output-format", "stream-json",
-            "--session-id", session_id,
-            "--effort", reasoning_effort,
-        ]
-        provider_settings = "ATREX_CLAUDE_SESSION_SETTINGS"
-    elif agent_cli == "qodercli":
-        cmd = [
-            "qodercli", "--print",
-            "--dangerously-skip-permissions",
-            "--output-format", "stream-json",
-            "--session-id", session_id,
-            "--no-session-persistence",
-            "--reasoning-effort", reasoning_effort,
-        ]
-        provider_settings = "ATREX_QODER_SESSION_SETTINGS"
-    elif agent_cli == "codex":
-        # --ephemeral is the Codex equivalent of a fresh, non-persistent session.  The
-        # dangerous bypass is intentional and symmetric with the existing Claude/Qoder
-        # automation flags: the coding agent must edit the local optimization workspace and
-        # invoke tools/sandbox.py non-interactively. GPU execution is still forced across the
-        # separately enforced atrex gateway boundary by the injected prompt.
-        cmd = [
-            "codex", "exec", "--json", "--ephemeral", "--color", "never",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "-c", f'model_reasoning_effort="{reasoning_effort}"',
-        ]
-        provider_settings = "ATREX_CODEX_SESSION_SETTINGS"
-    else:
-        raise ValueError(f"unsupported agent CLI: {agent_cli!r}")
-
-    # Provider-specific settings win. ATREX_SESSION_SETTINGS remains the backward-compatible
-    # generic fallback and is interpreted by whichever CLI was selected. Claude/Qoder expect
-    # their native --settings value; Codex expects the documented JSON object/array format.
-    session_settings = os.environ.get(provider_settings) or os.environ.get("ATREX_SESSION_SETTINGS")
-    if agent_cli == "codex":
-        cmd += _codex_settings_args(session_settings or "")
-    elif session_settings:
-        cmd += ["--settings", session_settings]
-    # Claude uses the upstream Humanize plugin. Qoder generates plans directly and must not load
-    # Humanize: its headless Skill tool cannot invoke the plugin's model-disabled gen-plan flow.
-    # Codex discovers the hydrated Humanize skill from the workspace-local .agents/skills tree.
-    if (
-        agent_cli == "claude"
-        and (HUMANIZE_DIR / "skills" / "humanize-gen-plan" / "SKILL.md").exists()
-    ):
-        cmd += ["--plugin-dir", str(HUMANIZE_DIR)]
-    cmd.append(prompt)
-    return cmd
+    """Compatibility route to the selected runtime adapter."""
+    return _agent_runtime.build_session_command(
+        agent_cli,
+        prompt,
+        session_id,
+        reasoning_effort,
+        humanize_dir=HUMANIZE_DIR,
+    )
 
 
 def _agent_auth_hint(agent_cli: str) -> str:
-    if agent_cli == "qodercli":
-        return "run `qodercli status` and `qodercli --print \"test\"` to diagnose"
-    if agent_cli == "codex":
-        return "run `codex login status` and `codex exec --ephemeral \"reply ok\"` to diagnose"
-    return "run `claude auth status` and `claude --print \"test\"` to diagnose"
-
+    """Compatibility route to the selected runtime diagnostics."""
+    return _agent_runtime.auth_hint(agent_cli)
 
 def _find_jq() -> Optional[str]:
     found = shutil.which("jq")
@@ -1223,26 +660,31 @@ def run_session(
 ) -> SessionResult:
     """Run one clean coding-agent session with no conversational memory from prior iterations."""
     session_id = str(uuid.uuid4())
-    cmd = _session_command(agent_cli, prompt, session_id, reasoning_effort)
-    env = _session_env(agent_cli)
-    env["IS_SANDBOX"] = "1"
-    if sandbox_hardware:
-        env["ATREX_SANDBOX_GPU"] = sandbox_hardware
-    if sandbox_url:
-        env["ATREX_SANDBOX_URL"] = sandbox_url
-        env.pop("ATREX_SANDBOX_PROFILE", None)
-    elif sandbox_profile:
-        env["ATREX_SANDBOX_PROFILE"] = sandbox_profile
-        env.pop("ATREX_SANDBOX_URL", None)
-    env["ATREX_SANDBOX_TIMEOUT"] = str(sandbox_timeout)
-    stdout, stderr, exit_status, timed_out = _run_bounded(cmd, cwd=workspace, timeout=timeout, env=env)
+    runtime = _agent_runtime.build_agent_runtime(
+        agent_cli,
+        process_runner=_run_bounded,
+        humanize_dir=HUMANIZE_DIR,
+    )
+    result = runtime.run(
+        _agent_runtime.AgentRunRequest(
+            workspace=workspace,
+            prompt=prompt,
+            timeout_s=timeout,
+            reasoning_effort=reasoning_effort,
+            sandbox_hardware=sandbox_hardware,
+            sandbox_profile=sandbox_profile,
+            sandbox_url=sandbox_url,
+            sandbox_timeout_s=sandbox_timeout,
+            session_id=session_id,
+        )
+    )
     return SessionResult(
-        exit_status=exit_status,
-        timed_out=timed_out,
-        tokens=_tokens_from_stream(stdout),
-        stdout_tail=stdout[-2000:],
-        stderr_tail=stderr[-2000:],
-        session_id=session_id,
+        exit_status=result.exit_status,
+        timed_out=result.timed_out,
+        tokens=result.tokens,
+        stdout_tail=result.stdout_tail,
+        stderr_tail=result.stderr_tail,
+        session_id=result.session_id,
     )
 
 
@@ -2426,7 +1868,12 @@ class Campaign:
     def _link_runtime(self) -> None:
         native_root = Path(self.atrex_bench_root) if self.atrex_bench_root else None
         link_runtime(self.workspace, native_root)
-        install_workspace_policy(self.workspace, self.optimization_mode, self.framework)
+        install_workspace_policy(
+            self.workspace,
+            self.optimization_mode,
+            self.framework,
+            agent_runtime=self.agent_cli,
+        )
 
     def _evaluator_directive(self) -> str:
         if self.atrex_bench_root:
@@ -5926,6 +5373,14 @@ class LayerCampaign:
     def _mode_directive(self) -> str:
         return optimization_mode_directive(self.optimization_mode, self.framework)
 
+    def _install_workspace_policy(self, workspace: Path) -> None:
+        install_workspace_policy(
+            workspace,
+            self.optimization_mode,
+            self.framework,
+            agent_runtime=self.agent_cli,
+        )
+
     def _manifest_path(self) -> Path:
         return self.layer_dir / "boundaries.json"
 
@@ -5936,7 +5391,7 @@ class LayerCampaign:
     def decompose(self) -> None:
         self.layer_dir.mkdir(parents=True, exist_ok=True)
         link_runtime(self.layer_dir)
-        install_workspace_policy(self.layer_dir, self.optimization_mode, self.framework)
+        self._install_workspace_policy(self.layer_dir)
         prompt = _render(
             PROMPTS_DIR / "decompose.md",
             LAYER_DIR=str(self.layer_dir), LAYER_DEMO=self.layer_demo,
@@ -5969,7 +5424,7 @@ class LayerCampaign:
             ws = self._boundary_ws(b["name"])
             b["workspace"] = str(ws)
             if latest_version(ws) >= 0:
-                install_workspace_policy(ws, self.optimization_mode, self.framework)
+                self._install_workspace_policy(ws)
                 continue  # already set up (resume)
             demo = self.layer_dir / b["kernel_demo"]
             boundary_name = f"{self.name}__{b['name']}"
@@ -5978,7 +5433,7 @@ class LayerCampaign:
             subprocess.run(["bash", str(WORKSPACE_INIT), boundary_name, str(demo)],
                            cwd=str(ws.parent), check=True)
             link_runtime(ws)
-            install_workspace_policy(ws, self.optimization_mode, self.framework)
+            self._install_workspace_policy(ws)
             self._write_shape_frame(ws, b)
             prompt = _render(
                 PROMPTS_DIR / "setup.md",
@@ -6185,7 +5640,7 @@ class LayerCampaign:
     # ── phase 4: recombine ────────────────────────────────────────────────────
     def recombine(self) -> None:
         link_runtime(self.layer_dir)
-        install_workspace_policy(self.layer_dir, self.optimization_mode, self.framework)
+        self._install_workspace_policy(self.layer_dir)
         prompt = _render(PROMPTS_DIR / "recombine.md",
                          LAYER_DIR=str(self.layer_dir),
                          HARDWARE=hardware_directive(self.platform, self.arch),

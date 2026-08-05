@@ -157,17 +157,30 @@ def workspace_policy_block(mode: str, framework: str) -> str:
     return f"{POLICY_BEGIN}\n\n{directive}\n\n{POLICY_END}\n"
 
 
-def install_workspace_policy(workspace: Path, mode: str, framework: str) -> None:
-    """Persist mode identity and append/replace the generated CLAUDE.md overlay.
+def install_workspace_policy(
+    workspace: Path,
+    mode: str,
+    framework: str,
+    *,
+    agent_runtime: str | None = None,
+) -> None:
+    """Persist immutable mode, framework, and optional campaign runtime identity.
 
-    The ignored state file prevents accidentally resuming one workspace under a
-    different policy. The production overlay explicitly overrides the permissive
-    framework section in the base CLAUDE.md.
+    Existing workspaces without ``agent_runtime`` remain readable. Their first
+    explicit post-upgrade runtime is adopted before a session starts; later
+    attempts to resume with another backend fail closed.
     """
     if mode not in OPTIMIZATION_MODE_CHOICES:
         raise ValueError(f"unsupported optimization mode: {mode!r}")
+    requested_runtime = (
+        str(agent_runtime).strip() if agent_runtime is not None else None
+    )
+    if agent_runtime is not None and not requested_runtime:
+        raise ValueError("agent_runtime must be a non-empty runtime id")
+
     workspace.mkdir(parents=True, exist_ok=True)
     state_path = workspace / MODE_STATE_FILE
+    state_changed = False
     if state_path.exists():
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -181,9 +194,25 @@ def install_workspace_policy(workspace: Path, mode: str, framework: str) -> None
                 f"recorded mode/framework={existing_mode}/{existing_framework}, "
                 f"requested={mode}/{framework}"
             )
+        existing_runtime = str(state.get("agent_runtime") or "").strip()
+        if requested_runtime and existing_runtime and existing_runtime != requested_runtime:
+            raise RuntimeError(
+                "workspace agent runtime mismatch: "
+                f"recorded={existing_runtime}, requested={requested_runtime}; "
+                "use a fresh campaign workspace to change backend"
+            )
+        if requested_runtime and not existing_runtime:
+            state["agent_runtime"] = requested_runtime
+            state_changed = True
     else:
+        state = {"mode": mode, "framework": framework}
+        if requested_runtime:
+            state["agent_runtime"] = requested_runtime
+        state_changed = True
+
+    if state_changed:
         state_path.write_text(
-            json.dumps({"mode": mode, "framework": framework}, indent=2) + "\n",
+            json.dumps(state, indent=2) + "\n",
             encoding="utf-8",
         )
 

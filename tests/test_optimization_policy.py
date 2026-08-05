@@ -44,6 +44,40 @@ class OptimizationPolicyTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "workspace policy mismatch"):
                 install_workspace_policy(workspace, "leaderboard", "Triton")
 
+    def test_workspace_policy_binds_one_agent_runtime_and_rejects_switches(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-policy-") as temp_dir:
+            workspace = Path(temp_dir)
+            install_workspace_policy(
+                workspace, "production", "Triton", agent_runtime="codex"
+            )
+            state_path = workspace / ".orchestrator_mode.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["agent_runtime"], "codex")
+
+            install_workspace_policy(
+                workspace, "production", "Triton", agent_runtime="codex"
+            )
+            with self.assertRaisesRegex(RuntimeError, "agent runtime mismatch"):
+                install_workspace_policy(
+                    workspace, "production", "Triton", agent_runtime="claude"
+                )
+
+    def test_legacy_workspace_adopts_the_first_explicit_agent_runtime(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-policy-legacy-") as temp_dir:
+            workspace = Path(temp_dir)
+            install_workspace_policy(workspace, "leaderboard", "Triton")
+            state_path = workspace / ".orchestrator_mode.json"
+            self.assertNotIn(
+                "agent_runtime",
+                json.loads(state_path.read_text(encoding="utf-8")),
+            )
+
+            install_workspace_policy(
+                workspace, "leaderboard", "Triton", agent_runtime="qodercli"
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["agent_runtime"], "qodercli")
+
     def test_exact_framework_candidates_pass(self) -> None:
         candidates = {
             "Triton": (
