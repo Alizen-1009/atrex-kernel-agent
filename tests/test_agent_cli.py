@@ -38,7 +38,7 @@ class AgentCliTest(unittest.TestCase):
 
         self.assertEqual(cmd[:2], ["codex", "exec"])
         self.assertIn("--json", cmd)
-        self.assertIn("--ephemeral", cmd)
+        self.assertNotIn("--ephemeral", cmd)
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
         self.assertEqual(cmd[-1], "do one iteration")
         self.assertNotIn("ignored-session-id", cmd)

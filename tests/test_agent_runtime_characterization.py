@@ -45,7 +45,6 @@ class AgentCommandCharacterizationTest(unittest.TestCase):
                 "codex",
                 "exec",
                 "--json",
-                "--ephemeral",
                 "--color",
                 "never",
                 "--dangerously-bypass-approvals-and-sandbox",
@@ -161,7 +160,7 @@ class AgentCommandCharacterizationTest(unittest.TestCase):
         )
         self.assertEqual(
             optimize._agent_auth_hint("codex"),
-            'run `codex login status` and `codex exec --ephemeral "reply ok"` to diagnose',
+            'run `codex login status` and `codex exec "reply ok"` to diagnose',
         )
         self.assertEqual(
             optimize._agent_auth_hint("pi"),
