@@ -4,8 +4,8 @@ Implementation must follow TDD: add a failing behavior test before each producti
 
 ## Phase 1 — Contracts and isolation artifacts
 
-- [ ] **Task 1:** Define Teacher campaign schemas and immutable domain models.
-  - Verify: `python -m unittest teacher_distill.tests.test_models -v`
+- [x] **Task 1:** Define Teacher campaign schemas and immutable domain models.
+  - Verified: `python3 -m unittest teacher_distill.tests.test_models -v`
 - [ ] **Task 2:** Validate and fingerprint self-contained Teacher bundles.
   - Depends on: Task 1
   - Verify: `python -m unittest teacher_distill.tests.test_bundle -v`
