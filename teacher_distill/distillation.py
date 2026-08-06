@@ -10,7 +10,11 @@ from typing import Callable
 from orchestrator import optimize
 from orchestrator.agent_runtime.process import ProcessAccessPolicy
 
-from .draft_validator import validate_distillation_drafts
+from .draft_validator import (
+    validate_distillation_drafts,
+    validate_gap_markdown,
+    validate_gap_source_fragments,
+)
 from .evidence import build_evidence_bundle
 from .models import CampaignTerminalStatus, TeacherCampaignResult
 from .state import PRIVATE_STATE_FILE, read_json_object, write_json_atomic
@@ -98,6 +102,23 @@ def _validate_gap_contract(path: Path) -> None:
         for finding in findings
     ):
         raise RuntimeError("every Teacher gap finding must be a hypothesis")
+    forbidden_assertions = (
+        "verified",
+        "causal",
+        "proven",
+        "confirmed",
+        "promotion-eligible",
+        "promotion eligible",
+        "已验证",
+        "因果",
+        "已证明",
+    )
+    for finding in findings:
+        if finding.get("promotion_eligible") not in (None, False):
+            raise RuntimeError("Teacher gap findings are not promotion-eligible")
+        rendered = json.dumps(finding, ensure_ascii=False, sort_keys=True).casefold()
+        if any(term in rendered for term in forbidden_assertions):
+            raise RuntimeError("Teacher gap finding contains a verified or causal assertion")
 
 
 def generate_distillation(
@@ -163,8 +184,10 @@ def generate_distillation(
         gap_json_source = gap_workspace / "teacher_gap_analysis.json"
         gap_markdown_source = gap_workspace / "teacher_gap_analysis.md"
         _validate_gap_contract(gap_json_source)
+        validate_gap_source_fragments(gap_json_source, private)
         if not gap_markdown_source.is_file():
             raise RuntimeError("gap-analysis Agent did not create teacher_gap_analysis.md")
+        validate_gap_markdown(gap_markdown_source)
 
         gap_json = output / "teacher_gap_analysis.json"
         shutil.copy2(gap_json_source, gap_json)

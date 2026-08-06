@@ -20,6 +20,18 @@ _VERIFIED_CLAIM = re.compile(
     r"\b(?:improved|reduced|increased|speedup|faster|effective|verified|提升|降低|加速|有效)\b",
     re.IGNORECASE,
 )
+_HARDWARE_FACT = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:sms?|kb|mb|gb|tb|mhz|ghz|threads?|warps?)\b",
+    re.IGNORECASE,
+)
+_CAUSAL_CLAIM = re.compile(
+    r"\b(?:because|due to|caused?|therefore|results? in|led to)\b|由于|因为|导致|因而",
+    re.IGNORECASE,
+)
+_GAP_ASSERTION = re.compile(
+    r"\b(?:verified|causal|proven|confirmed|promotion[- ]eligible)\b|已验证|因果|已证明",
+    re.IGNORECASE,
+)
 
 
 class DraftValidationError(RuntimeError):
@@ -53,9 +65,37 @@ def _teacher_source_lines(private: Path) -> set[str]:
             continue
         for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
             normalized = line.strip()
-            if len(normalized) >= 20:
+            if len(normalized) >= 8 and (
+                re.search(r"[=(){}\[\];@]", normalized)
+                or normalized.startswith(("def ", "class ", "import ", "from "))
+            ):
                 lines.add(normalized)
     return lines
+
+
+def _json_strings(value: object):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _json_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _json_strings(item)
+
+
+def validate_gap_source_fragments(path: Path, private: Path) -> None:
+    gap = read_json_object(path, "Teacher gap analysis")
+    teacher_lines = _teacher_source_lines(private)
+    for value in _json_strings(gap):
+        for line in value.splitlines():
+            normalized = line.strip()
+            if any(
+                fragment in normalized
+                or (len(normalized) >= 8 and normalized in fragment)
+                for fragment in teacher_lines
+            ):
+                raise DraftValidationError("Teacher source fragment found in gap JSON")
 
 
 def _validate_gap(root: Path) -> None:
@@ -68,6 +108,22 @@ def _validate_gap(root: Path) -> None:
         for finding in findings
     ):
         raise DraftValidationError("every Teacher gap finding must remain a hypothesis")
+    for finding in findings:
+        if finding.get("promotion_eligible") not in (None, False):
+            raise DraftValidationError("Teacher gap findings are not promotion-eligible")
+        claim_text = json.dumps(finding, ensure_ascii=False, sort_keys=True)
+        if _GAP_ASSERTION.search(claim_text):
+            raise DraftValidationError(
+                "Teacher gap finding contains a verified or causal assertion"
+            )
+
+
+def validate_gap_markdown(path: Path) -> None:
+    text = path.read_text(encoding="utf-8", errors="strict")
+    if _GAP_ASSERTION.search(text):
+        raise DraftValidationError(
+            "Teacher gap Markdown must remain hypothesis-only and non-causal"
+        )
 
 
 def _validate_markdown(
@@ -78,7 +134,12 @@ def _validate_markdown(
 ) -> None:
     text = path.read_text(encoding="utf-8", errors="strict")
     for line in text.splitlines():
-        if line.strip() in teacher_lines:
+        normalized = line.strip()
+        if any(
+            fragment in normalized
+            or (len(normalized) >= 8 and normalized in fragment)
+            for fragment in teacher_lines
+        ):
             raise DraftValidationError("Teacher source fragment found in %s" % relative)
     citations = _CITATION.findall(text)
     unknown = sorted(set(citations) - set(evidence))
@@ -88,11 +149,11 @@ def _validate_markdown(
         )
     for paragraph in re.split(r"\n\s*\n", text):
         paragraph_citations = _CITATION.findall(paragraph)
-        if _PERFORMANCE.search(paragraph) and not paragraph_citations:
+        if (_PERFORMANCE.search(paragraph) or _HARDWARE_FACT.search(paragraph)) and not paragraph_citations:
             raise DraftValidationError(
-                "%s contains a performance number without evidence citation" % relative
+                "%s contains a performance or hardware fact without evidence citation" % relative
             )
-        if _VERIFIED_CLAIM.search(paragraph):
+        if _VERIFIED_CLAIM.search(paragraph) or _CAUSAL_CLAIM.search(paragraph):
             if not any(
                 evidence[evidence_id].get("citable_as_verified")
                 for evidence_id in paragraph_citations
@@ -163,6 +224,7 @@ def validate_distillation_drafts(
         raise DraftValidationError("evidence manifest contains invalid or duplicate IDs")
 
     _validate_gap(root)
+    validate_gap_source_fragments(root / "teacher_gap_analysis.json", private)
     teacher_lines = _teacher_source_lines(private)
     for relative, path in documents:
         if path.suffix.lower() == ".md":
@@ -170,6 +232,7 @@ def validate_distillation_drafts(
     for gap_name in ("teacher_gap_analysis.md",):
         gap_path = root / gap_name
         if gap_path.is_file():
+            validate_gap_markdown(gap_path)
             _validate_markdown(gap_name, gap_path, evidence, teacher_lines)
 
     report = {

@@ -52,6 +52,25 @@ class TeacherSessionPolicy:
             label="teacher-hidden-audited",
         )
 
+    def filter_prompt(self, prompt: str) -> str:
+        """Remove inherited search instructions that violate Teacher isolation."""
+        forbidden = (
+            "reference-projects",
+            "public web",
+            "web search",
+            "kernelwiki",
+            "gpu-wiki/3rdparty",
+        )
+        lines = [
+            line
+            for line in prompt.splitlines()
+            if not any(term in line.casefold() for term in forbidden)
+        ]
+        filtered = "\n".join(lines).strip()
+        if any(term in filtered.casefold() for term in forbidden):
+            raise RuntimeError("Teacher prompt still contains an external-search instruction")
+        return filtered + "\n"
+
     def knowledge_directive(self) -> str:
         return (
             "## Hidden-Teacher knowledge policy (mandatory)\n\n"

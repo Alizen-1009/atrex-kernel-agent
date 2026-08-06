@@ -90,6 +90,32 @@ class TeacherRuntimeHydrationTest(unittest.TestCase):
         self.assertNotIn("/private/", directive)
         self.assertNotIn("/repo/", directive)
 
+    def test_prompt_filter_removes_inherited_external_search_instructions(self) -> None:
+        policy = TeacherSessionPolicy(
+            knowledge_view=Path("/sanitized/view"),
+            teacher_solution=Path("/private/teacher"),
+            private_root=Path("/private/supervisor"),
+            source_wiki=Path("/repo/gpu-wiki"),
+            reference_projects=Path("/repo/reference-projects"),
+        )
+        prompt = (
+            "Use gpu-wiki first.\n"
+            "- L2: inspect reference-projects/ when needed.\n"
+            "- L3: use public web and web search.\n"
+            "- Search KernelWiki under gpu-wiki/3rdparty/.\n"
+            "Then implement one change.\n"
+        )
+
+        filtered = policy.filter_prompt(prompt)
+
+        self.assertIn("Use gpu-wiki first", filtered)
+        self.assertIn("Then implement one change", filtered)
+        self.assertNotIn("reference-projects", filtered.casefold())
+        self.assertNotIn("public web", filtered.casefold())
+        self.assertNotIn("web search", filtered.casefold())
+        self.assertNotIn("kernelwiki", filtered.casefold())
+        self.assertNotIn("gpu-wiki/3rdparty", filtered.casefold())
+
 
 class ProcessAccessPolicyTest(unittest.TestCase):
     def _policy(self, audit_log: Path | None = None) -> ProcessAccessPolicy:
@@ -103,15 +129,19 @@ class ProcessAccessPolicyTest(unittest.TestCase):
     def test_forbidden_paths_and_network_commands_are_classified(self) -> None:
         policy = self._policy()
         cases = (
-            (["cat", "/private/teacher/kernel.py"], "forbidden path"),
-            (["bash", "-c", "rg gdn /repo/gpu-wiki"], "forbidden path"),
-            (["curl", "https://example.com/source.py"], "network access"),
-            (["git", "clone", "https://example.com/repo"], "network access"),
-            (["python", "-c", "import requests; requests.get('https://example.com')"], "network access"),
+            (["cat", "/private/teacher/kernel.py"], "forbidden path", None),
+            (["find", "/private"], "forbidden path", None),
+            (["cat", "../teacher/kernel.py"], "forbidden path", Path("/private/workspace")),
+            (["bash", "-c", "rg gdn /repo/gpu-wiki"], "forbidden path", None),
+            (["curl", "https://example.com/source.py"], "network access", None),
+            (["git", "clone", "https://example.com/repo"], "network access", None),
+            (["git", "push", "origin", "HEAD"], "network access", None),
+            (["python", "-c", "import requests; requests.get('https://example.com')"], "network access", None),
+            (["python", "-c", "import socket; socket.create_connection(('example.com', 80))"], "network access", None),
         )
-        for command, expected in cases:
+        for command, expected, cwd in cases:
             with self.subTest(command=command):
-                reason = dependency_process_violation(command, access_policy=policy)
+                reason = dependency_process_violation(command, access_policy=policy, cwd=cwd)
                 self.assertIsNotNone(reason)
                 self.assertIn("teacher knowledge access policy violation", reason)
                 self.assertIn(expected, reason)
@@ -155,7 +185,15 @@ class ProcessAccessPolicyTest(unittest.TestCase):
                     )
                 )
             environment = captured["env"]
+            command = captured["command"]
             self.assertIsInstance(environment, dict)
+            self.assertIsInstance(command, list)
+            if backend == "claude":
+                self.assertIn("--disallowedTools", command)
+                self.assertIn("WebSearch,WebFetch", command)
+            if backend == "pi":
+                self.assertIn("--tools", command)
+                self.assertIn("read,bash,edit,write", command)
             rendered = json.dumps(environment, sort_keys=True)
             self.assertNotIn(private_path, rendered)
             policy_id = environment.get("ATREX_ACCESS_POLICY_ID")
@@ -185,7 +223,7 @@ class ProcessAccessPolicyTest(unittest.TestCase):
                         sys.executable,
                         "-c",
                         "import subprocess; subprocess.run(['bash','-c',"
-                        + repr("cat %s; sleep 5" % forbidden)
+                        + repr("cat private/teacher.py; sleep 5")
                         + "])",
                     ],
                     cwd=root,
@@ -201,14 +239,67 @@ class ProcessAccessPolicyTest(unittest.TestCase):
             self.assertEqual(records[-1]["policy"], "teacher-hidden-audited")
             self.assertIn("forbidden path", records[-1]["reason"])
 
+    def test_shell_guard_violation_marks_parent_session_failed_and_audited(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-shell-marker-") as temp_dir:
+            root = Path(temp_dir)
+            audit = root / "audit.jsonl"
+            policy = ProcessAccessPolicy(
+                network_disabled=True,
+                audit_log=audit,
+                label="teacher-hidden-audited",
+            )
+            policy_id = register_access_policy(policy)
+            environment = os.environ.copy()
+            environment[ACCESS_POLICY_ENV] = policy_id
+            environment["BASH_ENV"] = str(
+                Path(__file__).resolve().parents[1]
+                / "tools"
+                / "session_shell_guard.sh"
+            )
+            try:
+                _stdout, stderr, returncode, _timed_out = run_bounded(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import subprocess; "
+                        "subprocess.run(['bash','-c','curl --version']); "
+                        "print('agent continued')",
+                    ],
+                    cwd=root,
+                    timeout=10,
+                    env=environment,
+                )
+            finally:
+                unregister_access_policy(policy_id)
+            records = [json.loads(line) for line in audit.read_text().splitlines()]
+
+        self.assertEqual(returncode, 126)
+        self.assertIn("network access", stderr)
+        self.assertIn("network access", records[-1]["reason"])
+
     def test_shell_guard_blocks_network_tools_but_keeps_local_git(self) -> None:
         environment = os.environ.copy()
         environment[ACCESS_POLICY_ENV] = "opaque-policy-id"
+        environment["ATREX_SESSION_WORKSPACE"] = str(Path.cwd())
         environment["BASH_ENV"] = str(
             Path(__file__).resolve().parents[1] / "tools" / "session_shell_guard.sh"
         )
         blocked = subprocess.run(
             ["bash", "-c", "curl --version"],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+        )
+        blocked_path = subprocess.run(
+            ["bash", "-c", "cat ../outside-workspace"],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+        )
+        blocked_git = subprocess.run(
+            ["bash", "-c", "git push origin HEAD"],
             capture_output=True,
             text=True,
             env=environment,
@@ -224,6 +315,10 @@ class ProcessAccessPolicyTest(unittest.TestCase):
 
         self.assertEqual(blocked.returncode, 126)
         self.assertIn("network access", blocked.stderr)
+        self.assertEqual(blocked_path.returncode, 126)
+        self.assertIn("outside the workspace", blocked_path.stderr)
+        self.assertEqual(blocked_git.returncode, 126)
+        self.assertIn("network access", blocked_git.stderr)
         self.assertEqual(allowed.returncode, 0, allowed.stderr)
 
     def test_session_policy_builds_private_parent_side_access_policy(self) -> None:

@@ -133,8 +133,10 @@ def _rewrite_missing_links(text: str, source_relative: str, allowed: set[str]) -
 
     def replace(match: re.Match[str]) -> str:
         raw_target = match.group(2).strip()
-        if raw_target.startswith(("#", "http://", "https://", "mailto:")):
+        if raw_target.startswith("#"):
             return match.group(0)
+        if raw_target.startswith(("http://", "https://", "mailto:")):
+            return match.group(1)
         target = _clean_link_target(raw_target)
         if not target or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target):
             return match.group(0)
@@ -168,10 +170,20 @@ def _make_files_read_only(root: Path) -> None:
     for path in root.rglob("*"):
         if path.is_file():
             path.chmod(path.stat().st_mode & ~0o222)
+    directories = [path for path in root.rglob("*") if path.is_dir()]
+    for path in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        path.chmod(path.stat().st_mode & ~0o222)
+    root.chmod(root.stat().st_mode & ~0o222)
 
 
 def _redacted_exclusion_path(path: str, reason: str) -> str:
-    if reason != "teacher-source":
+    sensitive_reasons = {
+        "explicit-path",
+        "teacher-source",
+        "operator-metadata",
+        "operator-identity",
+    }
+    if reason not in sensitive_reasons:
         return path
     return "redacted:" + hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
 
@@ -215,6 +227,12 @@ def build_knowledge_view(
     excluded: list[dict[str, str]] = []
     for page in pages:
         display_path = "%s/%s" % (page.area, page.rel_path)
+        denied = _deny_reason(page, provenance)
+        if denied:
+            excluded.append(
+                {"path": _redacted_exclusion_path(display_path, denied), "reason": denied}
+            )
+            continue
         if not query.matches_dimension(page, query.ARCH_ALIASES, arches):
             excluded.append({"path": display_path, "reason": "architecture-scope"})
             continue
@@ -223,12 +241,6 @@ def build_knowledge_view(
             continue
         if not query.matches_dimension(page, query.DSL_ALIASES, dsls):
             excluded.append({"path": display_path, "reason": "dsl-scope"})
-            continue
-        denied = _deny_reason(page, provenance)
-        if denied:
-            excluded.append(
-                {"path": _redacted_exclusion_path(display_path, denied), "reason": denied}
-            )
             continue
         included.append(page)
 

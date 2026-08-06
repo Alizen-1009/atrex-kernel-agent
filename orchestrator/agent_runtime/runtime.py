@@ -88,6 +88,15 @@ def token_usage_from_stream(stdout: str) -> int:
     return terminal_usage_from_stream(stdout).total_tokens or 0
 
 
+def restrict_network_tools(command: list[str], runtime_id: str) -> list[str]:
+    restricted = list(command)
+    if runtime_id == "claude":
+        restricted[-1:-1] = ["--disallowedTools", "WebSearch,WebFetch"]
+    elif runtime_id == "pi":
+        restricted[-1:-1] = ["--tools", "read,bash,edit,write"]
+    return restricted
+
+
 def build_session_environment(runtime_id: str) -> dict[str, str]:
     """Build the current guarded environment for one coding-agent session."""
     environment = os.environ.copy()
@@ -151,6 +160,8 @@ class CliAgentRuntime:
         command = self.build_command(
             request.prompt, session_id, request.reasoning_effort
         )
+        if request.access_policy is not None and request.access_policy.network_disabled:
+            command = restrict_network_tools(command, self.id)
         environment = build_session_environment(self.id)
         environment["IS_SANDBOX"] = "1"
         if request.sandbox_hardware:
@@ -173,6 +184,7 @@ class CliAgentRuntime:
         if request.access_policy is not None:
             policy_id = register_access_policy(request.access_policy)
             environment[ACCESS_POLICY_ENV] = policy_id
+            environment["ATREX_SESSION_WORKSPACE"] = str(request.workspace.resolve())
         try:
             stdout, stderr, exit_status, timed_out = self._process_runner(
                 command,

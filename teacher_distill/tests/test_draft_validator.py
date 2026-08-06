@@ -140,6 +140,24 @@ class DraftValidatorTest(unittest.TestCase):
             with self.assertRaisesRegex(DraftValidationError, "verified evidence"):
                 validate_distillation_drafts(drafts, private)
 
+    def test_hardware_and_causal_claims_require_verified_evidence(self) -> None:
+        cases = (
+            "The target has 132 SMs.\n",
+            "Latency fell because occupancy increased. [E-V2-MEMORY]\n",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                with tempfile.TemporaryDirectory(prefix="draft-claim-evidence-") as temp_dir:
+                    drafts, private = self._fixture(Path(temp_dir))
+                    (drafts / "journey.md").write_text(
+                        "# Journey\n\n" + text,
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        DraftValidationError, "evidence|verified|citation"
+                    ):
+                        validate_distillation_drafts(drafts, private)
+
     def test_unlisted_generated_document_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="draft-unlisted-") as temp_dir:
             drafts, private = self._fixture(Path(temp_dir))
@@ -157,6 +175,45 @@ class DraftValidatorTest(unittest.TestCase):
                 json.dumps(gap), encoding="utf-8"
             )
             with self.assertRaisesRegex(DraftValidationError, "hypothesis"):
+                validate_distillation_drafts(drafts, private)
+
+    def test_gap_findings_cannot_embed_verified_or_promotable_claims(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="draft-gap-finding-") as temp_dir:
+            drafts, private = self._fixture(Path(temp_dir))
+            gap = json.loads((drafts / "teacher_gap_analysis.json").read_text())
+            gap["findings"][0].update(
+                {
+                    "promotion_eligible": True,
+                    "claim": "Verified causal speedup from the Teacher structure",
+                }
+            )
+            (drafts / "teacher_gap_analysis.json").write_text(
+                json.dumps(gap), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                DraftValidationError, "hypothesis|promotion|verified|causal"
+            ):
+                validate_distillation_drafts(drafts, private)
+
+    def test_gap_markdown_cannot_claim_causality(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="draft-gap-markdown-") as temp_dir:
+            drafts, private = self._fixture(Path(temp_dir))
+            (drafts / "teacher_gap_analysis.md").write_text(
+                "# Gap\n\nThis difference is proven causal.\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(DraftValidationError, "hypothesis|causal"):
+                validate_distillation_drafts(drafts, private)
+
+    def test_teacher_source_fragment_in_gap_json_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="draft-gap-json-source-") as temp_dir:
+            drafts, private = self._fixture(Path(temp_dir))
+            gap = json.loads((drafts / "teacher_gap_analysis.json").read_text())
+            gap["findings"][0]["claim"] = "UNIQUE_PIPELINE_SEQUENCE = 12345"
+            (drafts / "teacher_gap_analysis.json").write_text(
+                json.dumps(gap), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(DraftValidationError, "Teacher source"):
                 validate_distillation_drafts(drafts, private)
 
     def test_teacher_source_fragment_is_rejected(self) -> None:

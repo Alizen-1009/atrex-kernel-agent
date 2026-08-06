@@ -84,6 +84,32 @@ class CampaignRuntimeBindingTest(unittest.TestCase):
             self.assertIs(run.call_args.kwargs["access_policy"], access)
             self.assertEqual(run.call_args.kwargs["extra_environment"], {"TRACE": "1"})
 
+    def test_campaign_session_hook_filters_before_reasserting_directive(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="campaign-prompt-filter-") as temp_dir:
+            campaign = optimize.Campaign(
+                name="demo",
+                kernel_demo="/tmp/reference.py",
+                platform="H20",
+                framework="CuteDSL",
+                work_dir=temp_dir,
+                session_directive="## final policy",
+                session_prompt_filter=lambda prompt: prompt.replace("forbidden", "sanitized"),
+            )
+            campaign.workspace.mkdir(parents=True)
+            with mock.patch.object(
+                optimize,
+                "run_session",
+                return_value=optimize.SessionResult(0, False, 1, "", "", "sid"),
+            ) as run:
+                campaign._run_agent_session("# forbidden task", timeout=10)
+
+            rendered = run.call_args.args[1]
+            self.assertNotIn("forbidden", rendered)
+            self.assertEqual(
+                rendered,
+                "## final policy\n\n# sanitized task\n\n## final policy",
+            )
+
     def test_layer_policy_helper_records_the_selected_runtime(self) -> None:
         with tempfile.TemporaryDirectory(prefix="layer-runtime-binding-") as temp_dir:
             layer = optimize.LayerCampaign(

@@ -7,6 +7,7 @@ import re
 import shlex
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -16,10 +17,11 @@ from pathlib import Path
 from typing import Protocol
 
 
-DEPENDENCY_GUARD_POLL_SECONDS = 0.25
+DEPENDENCY_GUARD_POLL_SECONDS = 0.05
 DEFAULT_PROTECTED_GATEWAY_SCREEN = "atrex-local-gateway"
 DEFAULT_PROTECTED_GATEWAY_STATE_NAME = "atrex-local-gateway"
 ACCESS_POLICY_ENV = "ATREX_ACCESS_POLICY_ID"
+ACCESS_VIOLATION_FILE_ENV = "ATREX_ACCESS_VIOLATION_FILE"
 
 
 @dataclass(frozen=True)
@@ -130,6 +132,7 @@ def python_import_roots(code: str, *, _depth: int = 0) -> set[str]:
 def dependency_process_violation(
     argv: list[str],
     access_policy: ProcessAccessPolicy | None = None,
+    cwd: Path | None = None,
 ) -> str | None:
     """Describe a forbidden dependency, host GPU, or scoped-access action."""
     if not argv:
@@ -248,17 +251,32 @@ def dependency_process_violation(
             if not matched:
                 for token in command_tokens:
                     candidate_text = token.strip("'\"").rstrip(";,)")
-                    if not candidate_text.startswith("/"):
+                    if "=" in candidate_text and not candidate_text.startswith(("http://", "https://")):
+                        candidate_text = candidate_text.split("=", 1)[1]
+                    if not candidate_text or candidate_text.startswith(("-", "http://", "https://")):
                         continue
-                    candidate = Path(candidate_text).expanduser().resolve(strict=False)
-                    if candidate == root or root in candidate.parents:
+                    candidate_path = Path(candidate_text).expanduser()
+                    if not candidate_path.is_absolute():
+                        if cwd is None or not any(
+                            marker in candidate_text for marker in ("/", "..", ".")
+                        ):
+                            continue
+                        candidate_path = Path(cwd) / candidate_path
+                    candidate = candidate_path.resolve(strict=False)
+                    if (
+                        candidate == root
+                        or root in candidate.parents
+                        or candidate in root.parents
+                    ):
                         matched = True
                         break
             if matched:
                 return "teacher knowledge access policy violation: forbidden path"
         if access_policy.network_disabled:
-            network_tools = {"curl", "wget", "ssh", "scp", "sftp", "ftp", "nc", "netcat"}
-            git_network_actions = {"clone", "fetch", "pull", "ls-remote", "submodule"}
+            network_tools = {
+                "curl", "wget", "ssh", "scp", "sftp", "ftp", "nc", "netcat", "gh", "aria2c"
+            }
+            git_network_actions = {"clone", "fetch", "pull", "push", "ls-remote", "submodule"}
             for segment in segments:
                 tokens = unwrap(segment)
                 if not tokens:
@@ -272,7 +290,9 @@ def dependency_process_violation(
                 if re.fullmatch(r"python[0-9.]*", executable) and "-c" in tokens:
                     code_index = tokens.index("-c") + 1
                     code = tokens[code_index] if code_index < len(tokens) else ""
-                    if python_import_roots(code) & {"requests", "urllib", "httpx", "aiohttp"}:
+                    if python_import_roots(code) & {
+                        "requests", "urllib", "httpx", "aiohttp", "socket", "ftplib", "smtplib"
+                    }:
                         return "teacher knowledge access policy violation: network access disabled"
 
     def shared_gateway_mutation(segment: list[str]) -> bool:
@@ -510,18 +530,53 @@ def _record_access_violation(
         pass
 
 
+def _process_cwd(pid: int, fallback: Path) -> Path:
+    try:
+        return Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
+    except (OSError, RuntimeError):
+        return fallback.resolve()
+
+
 def dependency_guard(
     proc: subprocess.Popen[str],
     stop: threading.Event,
     violations: list[str],
     access_policy: ProcessAccessPolicy | None = None,
+    cwd: Path = Path.cwd(),
+    violation_marker: Path | None = None,
 ) -> None:
     """Kill a coding session as soon as it starts a forbidden dependency job."""
     while not stop.wait(DEPENDENCY_GUARD_POLL_SECONDS):
         if proc.poll() is not None:
             return
+        if violation_marker is not None:
+            try:
+                marker_reasons = [
+                    line.strip()
+                    for line in violation_marker.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+            except OSError:
+                marker_reasons = []
+            if marker_reasons:
+                violation_marker.write_text("", encoding="utf-8")
+                for reason in marker_reasons:
+                    violations.append("shell guard: " + reason)
+                    _record_access_violation(access_policy, reason, ["shell-guard"])
+                process_groups = descendant_process_groups(proc.pid)
+                signal_process_groups(process_groups, signal.SIGTERM)
+                deadline = time.monotonic() + 1.0
+                while proc.poll() is None and time.monotonic() < deadline:
+                    if stop.wait(0.05):
+                        return
+                signal_process_groups(process_groups, signal.SIGKILL)
+                return
         for pid, argv in descendant_process_commands(proc.pid):
-            reason = dependency_process_violation(argv, access_policy=access_policy)
+            reason = dependency_process_violation(
+                argv,
+                access_policy=access_policy,
+                cwd=_process_cwd(pid, cwd),
+            )
             if reason is None:
                 continue
             rendered = " ".join(argv)
@@ -548,6 +603,13 @@ def run_bounded(
     access_policy = resolve_access_policy(policy_id) if policy_id else None
     if policy_id and access_policy is None:
         return "", "[orchestrator] unknown or expired process access policy\n", 126, False
+    child_env = dict(env or {})
+    violation_marker: Path | None = None
+    if access_policy is not None:
+        descriptor, marker_name = tempfile.mkstemp(prefix="atrex-access-violation-")
+        os.close(descriptor)
+        violation_marker = Path(marker_name)
+        child_env[ACCESS_VIOLATION_FILE_ENV] = marker_name
     proc = subprocess.Popen(
         command,
         cwd=str(cwd),
@@ -556,13 +618,20 @@ def run_bounded(
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
-        env=env,
+        env=child_env or None,
     )
     guard_stop = threading.Event()
     dependency_violations: list[str] = []
     guard = threading.Thread(
         target=dependency_guard,
-        args=(proc, guard_stop, dependency_violations, access_policy),
+        args=(
+            proc,
+            guard_stop,
+            dependency_violations,
+            access_policy,
+            Path(cwd),
+            violation_marker,
+        ),
         name=f"dependency-guard-{proc.pid}",
         daemon=True,
     )
@@ -588,6 +657,20 @@ def run_bounded(
         guard_stop.set()
         guard.join(timeout=1)
     returncode = proc.returncode
+    if violation_marker is not None:
+        try:
+            marker_reasons = [
+                line.strip()
+                for line in violation_marker.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except OSError:
+            marker_reasons = []
+        finally:
+            violation_marker.unlink(missing_ok=True)
+        for reason in marker_reasons:
+            dependency_violations.append("shell guard: " + reason)
+            _record_access_violation(access_policy, reason, ["shell-guard"])
     if dependency_violations:
         policy_message = (
             "[orchestrator] dependency policy violation; terminated coding session:\n"

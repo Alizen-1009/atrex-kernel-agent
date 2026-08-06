@@ -45,7 +45,8 @@ class KnowledgeViewTest(unittest.TestCase):
                 "# CuteDSL API\n\nGeneric framework programming model.\n",
             "docs/nvidia/hopper/kernel-opt/techniques/vectorized.md":
                 "# Vectorized Loads\n\nGeneric aligned vector access. "
-                "[Operator example](../../ref-docs/cutedsl/gdn.md).\n",
+                "[Operator example](../../ref-docs/cutedsl/gdn.md). "
+                "[External reference](https://example.com/secret-source).\n",
             "docs/nvidia/hopper/kernel-opt/techniques/operator-note.md":
                 "# Generic Operator Note\n\nA generic note for recurrent kernels.\n\n"
                 "For GDN, copy the Teacher's TMA structure.\n",
@@ -188,11 +189,28 @@ class KnowledgeViewTest(unittest.TestCase):
             ).read_text(encoding="utf-8")
             self.assertNotIn("gdn.md", vectorized)
             self.assertIn("Operator example", vectorized)
+            self.assertIn("External reference", vectorized)
+            self.assertNotIn("https://", vectorized)
+            self.assertNotIn("example.com", vectorized)
 
             report = json.loads((view.root / "knowledge-view.json").read_text(encoding="utf-8"))
-            excluded = {row["path"]: row["reason"] for row in report["excluded"]}
-            self.assertIn("docs/nvidia/hopper/ref-docs/cutedsl/gdn.md", excluded)
-            self.assertIn("operator", excluded["docs/nvidia/hopper/ref-docs/cutedsl/gdn.md"])
+            sensitive_reasons = {
+                "explicit-path",
+                "teacher-source",
+                "operator-metadata",
+                "operator-identity",
+            }
+            sensitive = [
+                row for row in report["excluded"] if row["reason"] in sensitive_reasons
+            ]
+            self.assertTrue(sensitive)
+            self.assertTrue(
+                all(row["path"].startswith("redacted:") for row in sensitive)
+            )
+            serialized_report = json.dumps(report).casefold()
+            self.assertNotIn("flashinfer", serialized_report)
+            self.assertNotIn("gdn.md", serialized_report)
+            self.assertNotIn("operator-note.md", serialized_report)
 
     def test_view_is_content_addressed_reused_and_changes_with_allowed_content(self) -> None:
         with tempfile.TemporaryDirectory(prefix="knowledge-view-hash-") as temp_dir:
@@ -253,6 +271,8 @@ class KnowledgeViewTest(unittest.TestCase):
             self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
             self.assertEqual((view.root / "manifest.json").stat().st_mode & 0o222, 0)
             self.assertEqual((view.root / "README.md").stat().st_mode & 0o222, 0)
+            self.assertEqual(view.root.stat().st_mode & 0o222, 0)
+            self.assertEqual((view.root / "docs").stat().st_mode & 0o222, 0)
 
     def test_missing_wiki_contract_files_and_unknown_architecture_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="knowledge-view-invalid-") as temp_dir:
