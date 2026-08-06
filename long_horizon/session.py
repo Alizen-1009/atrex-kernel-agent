@@ -5,10 +5,11 @@ import signal
 import time
 import uuid
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Callable
 
 from . import main_adapter
-from .models import EpisodeHandoff, SessionResult
+from .models import EpisodeHandoff, InvocationObservation, SessionResult
 from .protocol import handoff_diagnosis, read_handoff
 
 
@@ -64,6 +65,7 @@ class LongSessionRunner:
         completion_check: CompletionCheck,
         reasoning_effort: str = "max",
         session_id: str = "",
+        telemetry_environment: Mapping[str, str] | None = None,
     ) -> SessionResult:
         session_id = session_id or str(uuid.uuid4())
         active_session_id = session_id if self.agent_cli != "codex" else ""
@@ -76,6 +78,10 @@ class LongSessionRunner:
             else main_adapter.session_environment(self.agent_cli)
         )
         environment["IS_SANDBOX"] = "1"
+        if telemetry_environment:
+            environment.update(
+                {str(key): str(value) for key, value in telemetry_environment.items()}
+            )
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
         total_tokens = 0
@@ -84,6 +90,7 @@ class LongSessionRunner:
         exit_status = 0
         timed_out = False
         resume_count = 0
+        invocations: list[InvocationObservation] = []
 
         for attempt in range(max(0, handoff_resumes) + 1):
             remaining = int(deadline - time.monotonic())
@@ -138,6 +145,17 @@ class LongSessionRunner:
             stdout_parts.append(stdout)
             stderr_parts.append(stderr)
             total_tokens += main_adapter.tokens_from_stream(stdout)
+            events, terminal_usage, capabilities, observation_errors = (
+                main_adapter.normalize_stream(self.agent_cli, stdout)
+            )
+            invocations.append(
+                InvocationObservation(
+                    terminal_usage=terminal_usage,
+                    events=events,
+                    capabilities=capabilities,
+                    observation_errors=observation_errors,
+                )
+            )
             observed_session_id = main_adapter.session_id_from_stream(
                 self.agent_cli, stdout, session_id
             )
@@ -194,4 +212,5 @@ class LongSessionRunner:
             stdout_tail=stdout_all[-4000:],
             stderr_tail=stderr_all[-4000:],
             completion_diagnosis=completion_diagnosis,
+            invocations=tuple(invocations),
         )

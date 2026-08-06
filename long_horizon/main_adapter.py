@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from orchestrator import optimize as base
+from orchestrator.agent_runtime.adapter import DEFAULT_BACKEND_REGISTRY
+from orchestrator.agent_runtime.model import (
+    AgentRuntimeCapabilities,
+    NormalizedAgentEvent,
+    TokenUsage,
+)
+from orchestrator.agent_runtime.runtime import (
+    DEFAULT_HUMANIZE_DIR,
+    terminal_usage_from_stream,
+)
 from orchestrator.optimization_policy import install_workspace_policy
 
 
@@ -164,6 +175,32 @@ def run_bounded(
 
 def tokens_from_stream(stdout: str) -> int:
     return base._tokens_from_stream(stdout)
+
+
+def normalize_stream(
+    agent_cli: str, stdout: str
+) -> tuple[
+    tuple[NormalizedAgentEvent, ...],
+    TokenUsage,
+    AgentRuntimeCapabilities,
+    tuple[str, ...],
+]:
+    """Observe one long-session invocation through main's backend adapter."""
+    adapter = DEFAULT_BACKEND_REGISTRY.create(agent_cli, DEFAULT_HUMANIZE_DIR)
+    observation_errors: tuple[str, ...] = ()
+    try:
+        events, terminal_usage = adapter.normalize_stream(stdout)
+    except Exception as exc:
+        events = ()
+        terminal_usage = terminal_usage_from_stream(stdout)
+        observation_errors = (
+            f"stream_normalization_failed:{type(exc).__name__}",
+        )
+    capabilities = replace(
+        adapter.capabilities,
+        usage_delta_observed=any(event.kind == "usage_delta" for event in events),
+    )
+    return events, terminal_usage, capabilities, observation_errors
 
 
 def latest_version(workspace: Path) -> int:
