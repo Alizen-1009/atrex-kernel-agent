@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 from long_horizon import main_adapter
+from orchestrator.agent_runtime.model import AgentRuntimeCapabilities
 
 
 class SessionAdapterTests(unittest.TestCase):
@@ -38,6 +39,26 @@ class SessionAdapterTests(unittest.TestCase):
             command[command.index("--session-id") + 1], "pi-session-id"
         )
         self.assertFalse(main_adapter.supports_same_session_resume("pi"))
+
+    def test_stream_normalization_failure_preserves_terminal_total(self) -> None:
+        adapter = mock.Mock()
+        adapter.capabilities = AgentRuntimeCapabilities(True, True, True)
+        adapter.normalize_stream.side_effect = ValueError("malformed stream")
+        stdout = json.dumps(
+            {"type": "turn.completed", "usage": {"input_tokens": 7, "output_tokens": 2}}
+        )
+
+        with mock.patch.object(
+            main_adapter.DEFAULT_BACKEND_REGISTRY, "create", return_value=adapter
+        ):
+            events, terminal, capabilities, errors = main_adapter.normalize_stream(
+                "codex", stdout
+            )
+
+        self.assertEqual(events, ())
+        self.assertEqual(terminal.total_tokens, 9)
+        self.assertFalse(capabilities.usage_delta_observed)
+        self.assertEqual(errors, ("stream_normalization_failed:ValueError",))
 
     def test_codex_thread_id_is_read_from_jsonl(self) -> None:
         thread_id = "019c1234-5678-7abc-8def-0123456789ab"
