@@ -79,6 +79,20 @@ class BackendFixtureTest(unittest.TestCase):
         self.assertEqual(events[1].action, "start")
         self.assertEqual(terminal.total_tokens, 214)
 
+    def test_claude_duplicate_message_usage_is_counted_once(self) -> None:
+        stdout = "\n".join(
+            [
+                '{"type":"assistant","message":{"id":"msg-1","usage":{"input_tokens":2,"output_tokens":3}}}',
+                '{"type":"assistant","message":{"id":"msg-1","usage":{"input_tokens":2,"output_tokens":3}}}',
+                '{"type":"result","usage":{"input_tokens":2,"output_tokens":3}}',
+            ]
+        )
+
+        events, terminal = ClaudeAdapter(Path("missing")).normalize_stream(stdout)
+
+        self.assertEqual([event.kind for event in events], ["usage_delta", "terminal_usage"])
+        self.assertEqual(terminal.total_tokens, 5)
+
     def test_qoder_fixture_supports_camel_case_usage(self) -> None:
         events, terminal = QoderAdapter(Path("missing")).normalize_stream(
             (FIXTURES / "qoder_usage.jsonl").read_text()
@@ -87,6 +101,20 @@ class BackendFixtureTest(unittest.TestCase):
         self.assertEqual([event.kind for event in events].count("usage_delta"), 2)
         self.assertEqual([event.kind for event in events].count("phase_marker"), 2)
         self.assertEqual(terminal.total_tokens, 15)
+
+    def test_qoder_zero_only_usage_is_unavailable(self) -> None:
+        stdout = "\n".join(
+            [
+                '{"type":"assistant","message":{"usage":{"inputTokens":0,"outputTokens":0}}}',
+                '{"type":"result","usage":{"inputTokens":0,"outputTokens":0}}',
+            ]
+        )
+
+        events, terminal = QoderAdapter(Path("missing")).normalize_stream(stdout)
+
+        self.assertEqual(events, ())
+        self.assertIsNone(terminal.total_tokens)
+        self.assertEqual(terminal.measurement, "unavailable")
 
     def test_pi_fixture_yields_deltas_receipts_and_derived_terminal_usage(self) -> None:
         adapter = PiAdapter(Path("missing"))
