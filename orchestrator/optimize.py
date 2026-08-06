@@ -83,6 +83,7 @@ try:
     from . import agent_runtime as _agent_runtime
     from .aggregate_dispatch import embed_bucket_sources
     from .telemetry import IterationTelemetryRecorder, changed_paths_since
+    from .stop_policy import DefaultStopPolicy, StopDecision, StopDecisionStatus, StopPolicy
     from .optimization_policy import (
         OPTIMIZATION_MODE_CHOICES,
         install_workspace_policy,
@@ -97,6 +98,12 @@ except ImportError:  # direct script execution: python orchestrator/optimize.py
     from telemetry import (  # type: ignore[no-redef]
         IterationTelemetryRecorder,
         changed_paths_since,
+    )
+    from stop_policy import (  # type: ignore[no-redef]
+        DefaultStopPolicy,
+        StopDecision,
+        StopDecisionStatus,
+        StopPolicy,
     )
     from optimization_policy import (  # type: ignore[no-redef]
         OPTIMIZATION_MODE_CHOICES,
@@ -1813,6 +1820,7 @@ class Campaign:
     optimization_mode: str = "leaderboard"  # permissive contest flow or strict production gate
     framework_baseline: str = "auto"        # auto = production only; always | never override it
     framework_baseline_timeout: int = FRAMEWORK_BASELINE_TIMEOUT_S
+    stop_policy: Optional[StopPolicy] = field(default=None, repr=False, compare=False)
     on_improvement: Optional[Callable[["Campaign", int, dict], None]] = field(
         default=None, repr=False, compare=False
     )
@@ -1830,6 +1838,22 @@ class Campaign:
     def workspace(self) -> Path:
         base = Path(self.work_dir) if self.work_dir else Path.cwd()
         return base / f"kernel_opt_{self.campaign_name}"
+
+    def _accepted_stop_decision(self, version: int, memory: dict) -> StopDecision:
+        policy = self.stop_policy or DefaultStopPolicy()
+        decision = policy.evaluate_accepted_iteration(self, version, memory)
+        if not isinstance(decision, StopDecision):
+            raise TypeError("stop policy must return a StopDecision")
+        return decision
+
+    @staticmethod
+    def _report_stop_policy_infra_error(decision: StopDecision) -> None:
+        if decision.status == StopDecisionStatus.INFRA_ERROR:
+            print(
+                f"[orchestrator] stop-policy infrastructure error: {decision.reason}; continuing",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _account(self, res: SessionResult, label: str) -> None:
         self.tokens_spent += res.tokens
@@ -2823,12 +2847,11 @@ class Campaign:
                     print("[orchestrator] converted triton->gluon (perf parity ok); optimizing gluon", flush=True)
                     self._notify_improvement(n, mem, previous_latency)
                     self._notify_iteration(n, mem, True)
-                    if peak_util(mem) >= self.target_util:
+                    decision = self._accepted_stop_decision(n, mem or {})
+                    if decision.status == StopDecisionStatus.SUCCESS:
                         mask_half_memory(self.workspace, n)
-                        return self._finish(
-                            f"success: peak_util {peak_util(mem):.1f}% >= "
-                            f"{self.target_util:.0f}%"
-                        )
+                        return self._finish(decision.reason)
+                    self._report_stop_policy_infra_error(decision)
                     mask_half_memory(self.workspace, n)
                     continue
                 # Revert every rejected kernel-changing conversion commit, including a session that
@@ -2883,11 +2906,11 @@ class Campaign:
             if won:                        # reuse the git-native win computed above
                 self._notify_improvement(n, mem, previous_latency)
                 self._notify_iteration(n, mem, True)
-                if peak_util(mem) >= self.target_util:
+                decision = self._accepted_stop_decision(n, mem or {})
+                if decision.status == StopDecisionStatus.SUCCESS:
                     mask_half_memory(self.workspace, n)
-                    return self._finish(
-                        f"success: peak_util {peak_util(mem):.1f}% >= {self.target_util:.0f}%"
-                    )
+                    return self._finish(decision.reason)
+                self._report_stop_policy_infra_error(decision)
                 stall = 0
                 write_stall(self.workspace, stall)
             else:
