@@ -68,6 +68,35 @@ def summarize_episode(
         if invocation_summaries
         else _fallback_phase_tokens(control_tokens)
     )
+    aggregate_phases = phase_tokens.get("phases")
+    if isinstance(aggregate_phases, Mapping):
+        for phase in PHASES:
+            intervals: list[dict[str, Any]] = []
+            for invocation_summary in invocation_summaries:
+                invocation = int(invocation_summary["invocation"])
+                invocation_tokens = invocation_summary.get("phase_tokens")
+                invocation_tokens = (
+                    invocation_tokens if isinstance(invocation_tokens, Mapping) else {}
+                )
+                invocation_phases = invocation_tokens.get("phases")
+                invocation_phases = (
+                    invocation_phases if isinstance(invocation_phases, Mapping) else {}
+                )
+                phase_payload = invocation_phases.get(phase)
+                phase_payload = phase_payload if isinstance(phase_payload, Mapping) else {}
+                for interval in phase_payload.get("intervals") or []:
+                    if not isinstance(interval, Mapping):
+                        continue
+                    intervals.append(
+                        {
+                            "invocation": invocation,
+                            "index": interval.get("index"),
+                            "usage": interval.get("usage"),
+                        }
+                    )
+            aggregate_phase = aggregate_phases.get(phase)
+            if isinstance(aggregate_phase, dict):
+                aggregate_phase["intervals"] = intervals
     reasons = set(str(value) for value in phase_tokens.get("reason_codes", []))
     if not invocation_summaries:
         reasons.add("structured_usage_unavailable")
@@ -154,27 +183,64 @@ def render_episode_brief(summary: Mapping[str, Any]) -> str:
             + " |"
         )
 
+    interval_rows: list[str] = []
+    for phase in PHASES:
+        payload = phases.get(phase)
+        payload = payload if isinstance(payload, Mapping) else {}
+        for interval in payload.get("intervals") or []:
+            if not isinstance(interval, Mapping):
+                continue
+            usage = interval.get("usage")
+            usage = usage if isinstance(usage, Mapping) else {}
+            interval_rows.append(
+                "| "
+                + " | ".join(
+                    [
+                        phase,
+                        str(interval.get("invocation") or "—"),
+                        str(interval.get("index") or "—"),
+                        cell(usage.get("input_tokens")),
+                        cell(usage.get("output_tokens")),
+                        cell(usage.get("cache_read_tokens")),
+                        cell(usage.get("cache_write_tokens")),
+                        cell(usage.get("total_tokens")),
+                        str(usage.get("measurement") or "unavailable"),
+                    ]
+                )
+                + " |"
+            )
+
     terminal = tokens.get("terminal_usage")
     terminal = terminal if isinstance(terminal, Mapping) else {}
-    return "\n".join(
-        [
-            f"# Long-horizon Episode {summary.get('episode', 'unknown')}",
-            "",
-            f"- version: `{summary.get('version', 'unknown')}`",
-            f"- status: `{summary.get('status', 'unknown')}`",
-            f"- accepted: `{bool(summary.get('accepted'))}`",
-            f"- invocations/resumes: `{summary.get('invocation_count', 0)}` / `{summary.get('resume_count', 0)}`",
-            f"- control tokens: `{cell(summary.get('control_tokens'))}`",
-            f"- structured terminal tokens: `{cell(terminal.get('total_tokens'))}`",
-            f"- semantic coverage: `{tokens.get('semantic_phase_coverage', 'unavailable')}`",
-            f"- accounted coverage: `{tokens.get('accounted_coverage', 'unavailable')}`",
-            f"- measurement: `{summary.get('measurement', 'unavailable')}`",
-            f"- reason codes: `{', '.join(summary.get('reason_codes') or []) or 'none'}`",
-            "",
-            "## Phase token usage",
-            "",
-            "| Phase | Input | Output | Cache read | Cache write | Total | Intervals | Measurement |",
-            "|---|---:|---:|---:|---:|---:|---:|---|",
-            *rows,
-        ]
-    )
+    lines = [
+        f"# Long-horizon Episode {summary.get('episode', 'unknown')}",
+        "",
+        f"- version: `{summary.get('version', 'unknown')}`",
+        f"- status: `{summary.get('status', 'unknown')}`",
+        f"- accepted: `{bool(summary.get('accepted'))}`",
+        f"- invocations/resumes: `{summary.get('invocation_count', 0)}` / `{summary.get('resume_count', 0)}`",
+        f"- control tokens: `{cell(summary.get('control_tokens'))}`",
+        f"- structured terminal tokens: `{cell(terminal.get('total_tokens'))}`",
+        f"- semantic coverage: `{tokens.get('semantic_phase_coverage', 'unavailable')}`",
+        f"- accounted coverage: `{tokens.get('accounted_coverage', 'unavailable')}`",
+        f"- measurement: `{summary.get('measurement', 'unavailable')}`",
+        f"- reason codes: `{', '.join(summary.get('reason_codes') or []) or 'none'}`",
+        "",
+        "## Phase token usage",
+        "",
+        "| Phase | Input | Output | Cache read | Cache write | Total | Intervals | Measurement |",
+        "|---|---:|---:|---:|---:|---:|---:|---|",
+        *rows,
+    ]
+    if interval_rows:
+        lines.extend(
+            [
+                "",
+                "## Phase interval token usage",
+                "",
+                "| Phase | Invocation | Interval | Input | Output | Cache read | Cache write | Total | Measurement |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+                *interval_rows,
+            ]
+        )
+    return "\n".join(lines)

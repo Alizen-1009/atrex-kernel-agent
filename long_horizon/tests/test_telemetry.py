@@ -70,7 +70,16 @@ class EpisodeTelemetryTests(unittest.TestCase):
         self.assertEqual(
             tokens["phases"]["implementation"]["usage"]["total_tokens"], 10
         )
-        self.assertEqual(tokens["phases"]["implementation"]["interval_count"], 2)
+        implementation = tokens["phases"]["implementation"]
+        self.assertEqual(implementation["interval_count"], 2)
+        self.assertEqual(
+            [value["usage"]["total_tokens"] for value in implementation["intervals"]],
+            [4, 6],
+        )
+        self.assertEqual(
+            [value["invocation"] for value in implementation["intervals"]],
+            [1, 1],
+        )
         self.assertEqual(tokens["orchestration"]["total_tokens"], 10)
         self.assertEqual(tokens["unattributed"]["total_tokens"], 0)
         self.assertEqual(tokens["accounted_coverage"], 1.0)
@@ -81,6 +90,7 @@ class EpisodeTelemetryTests(unittest.TestCase):
         brief = render_episode_brief(summary)
         self.assertIn("Episode 3", brief)
         self.assertIn("implementation", brief)
+        self.assertIn("| implementation | 1 | 2 |", brief)
         self.assertIn("30", brief)
 
     def test_resumed_episode_is_attempt_first_and_marked_unqualified(self) -> None:
