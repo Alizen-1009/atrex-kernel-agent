@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -171,6 +172,48 @@ class TeacherStopPolicyTest(unittest.TestCase):
 
                 self.assertEqual(decision.status, expected_decision)
                 self.assertEqual(persisted["abba_status"], status.value)
+
+    def test_progress_is_committed_as_metadata_so_a_later_reset_cannot_erase_it(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-stop-commit-") as temp_dir:
+            root = Path(temp_dir)
+            verifier = FakeVerifier(self._result(AbbaStatus.PASS))
+            policy = TeacherStopPolicy(self._target(), self._teacher(root), verifier)
+            campaign = self._campaign(root)
+            (campaign.workspace / "memory/v2.json").write_text(
+                json.dumps(self._memory(118.0, 95.0, 140.0)), encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "-q"], cwd=campaign.workspace, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@local"], cwd=campaign.workspace, check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "test"], cwd=campaign.workspace, check=True
+            )
+            subprocess.run(["git", "add", "-A"], cwd=campaign.workspace, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "candidate"], cwd=campaign.workspace, check=True
+            )
+
+            policy.evaluate_accepted_iteration(
+                campaign, 2, self._memory(118.0, 95.0, 140.0)
+            )
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=campaign.workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            message = subprocess.run(
+                ["git", "log", "-1", "--pretty=%s"],
+                cwd=campaign.workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        self.assertEqual(status, "")
+        self.assertEqual(message, "v2: record Teacher progress")
 
     def test_missing_invalid_or_mismatched_measurements_fail_closed(self) -> None:
         cases = (

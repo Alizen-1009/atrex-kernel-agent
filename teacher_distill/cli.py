@@ -38,6 +38,7 @@ class TeacherDistillRequest:
     max_stall: int
     iter_timeout: int
     setup_timeout: int
+    salvage_timeout: int
     framework_baseline_timeout: int
     sandbox_hardware: str
     sandbox_profile: str
@@ -138,9 +139,10 @@ def build_request(
         notes=args.notes,
         max_iters=args.max_iters,
         token_budget=args.token_budget,
-        max_stall=args.max_stall,
+        max_stall=args.max_stall or 5,
         iter_timeout=args.iter_timeout,
         setup_timeout=args.setup_timeout,
+        salvage_timeout=args.salvage_timeout,
         framework_baseline_timeout=args.framework_baseline_timeout,
         sandbox_hardware=sandbox_hardware,
         sandbox_profile=args.sandbox_profile,

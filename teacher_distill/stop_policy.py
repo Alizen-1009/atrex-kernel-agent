@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
@@ -93,6 +94,30 @@ class TeacherStopPolicy:
             encoding="utf-8",
         )
         os.replace(temporary, path)
+        if (workspace / ".git").exists():
+            relative = path.relative_to(workspace).as_posix()
+            subprocess.run(
+                ["git", "add", "--", relative],
+                cwd=workspace,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            changed = subprocess.run(
+                ["git", "diff", "--cached", "--quiet", "--", relative],
+                cwd=workspace,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode
+            if changed != 0:
+                subprocess.run(
+                    ["git", "commit", "-m", "v%d: record Teacher progress" % version],
+                    cwd=workspace,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
 
     def evaluate_accepted_iteration(
         self,

@@ -1857,6 +1857,13 @@ class Campaign:
     framework_baseline: str = "auto"        # auto = production only; always | never override it
     framework_baseline_timeout: int = FRAMEWORK_BASELINE_TIMEOUT_S
     stop_policy: Optional[StopPolicy] = field(default=None, repr=False, compare=False)
+    runtime_linker: Optional[Callable[["Campaign"], None]] = field(
+        default=None, repr=False, compare=False
+    )
+    session_directive: str = field(default="", repr=False, compare=False)
+    session_access_policy: Optional[_agent_runtime.ProcessAccessPolicy] = field(
+        default=None, repr=False, compare=False
+    )
     on_improvement: Optional[Callable[["Campaign", int, dict], None]] = field(
         default=None, repr=False, compare=False
     )
@@ -1891,6 +1898,30 @@ class Campaign:
                 flush=True,
             )
 
+    def _run_agent_session(
+        self,
+        prompt: str,
+        *,
+        timeout: int,
+        reasoning_effort: str = "max",
+        extra_environment: Optional[dict[str, str]] = None,
+    ) -> SessionResult:
+        if self.session_directive:
+            prompt = self.session_directive.rstrip() + "\n\n" + prompt
+        return run_session(
+            self.workspace,
+            prompt,
+            timeout=timeout,
+            agent_cli=self.agent_cli,
+            sandbox_hardware=self.sandbox_hardware,
+            sandbox_profile=self.sandbox_profile,
+            sandbox_url=self.sandbox_url,
+            sandbox_timeout=self.sandbox_timeout,
+            reasoning_effort=reasoning_effort,
+            extra_environment=extra_environment,
+            access_policy=self.session_access_policy,
+        )
+
     def _account(self, res: SessionResult, label: str) -> None:
         self.tokens_spent += res.tokens
         print(f"[orchestrator] {label}: exit={res.exit_status} timed_out={res.timed_out} "
@@ -1922,13 +1953,9 @@ class Campaign:
             MODE_POLICY=self._mode_directive(),
         )
         head_before = git_head(self.workspace)
-        salvage_res = run_session(
-            self.workspace, prompt, timeout=self.salvage_timeout,
-            agent_cli=self.agent_cli,
-            sandbox_hardware=self.sandbox_hardware,
-            sandbox_profile=self.sandbox_profile,
-            sandbox_url=self.sandbox_url,
-            sandbox_timeout=self.sandbox_timeout,
+        salvage_res = self._run_agent_session(
+            prompt,
+            timeout=self.salvage_timeout,
             reasoning_effort="high",
         )
         self._account(salvage_res, f"salvage v{n}")
@@ -1971,8 +1998,11 @@ class Campaign:
         )
 
     def _link_runtime(self) -> None:
-        native_root = Path(self.atrex_bench_root) if self.atrex_bench_root else None
-        link_runtime(self.workspace, native_root)
+        if self.runtime_linker is not None:
+            self.runtime_linker(self)
+        else:
+            native_root = Path(self.atrex_bench_root) if self.atrex_bench_root else None
+            link_runtime(self.workspace, native_root)
         install_workspace_policy(
             self.workspace,
             self.optimization_mode,
@@ -2057,13 +2087,9 @@ class Campaign:
             EVALUATOR=self._evaluator_directive(),
             MODE_POLICY=self._mode_directive(),
         )
-        res = run_session(
-            self.workspace, prompt, timeout=self.setup_timeout,
-            agent_cli=self.agent_cli,
-            sandbox_hardware=self.sandbox_hardware,
-            sandbox_profile=self.sandbox_profile,
-            sandbox_url=self.sandbox_url,
-            sandbox_timeout=self.sandbox_timeout,
+        res = self._run_agent_session(
+            prompt,
+            timeout=self.setup_timeout,
             reasoning_effort="high",
         )
         self._account(res, "setup")
@@ -2100,15 +2126,9 @@ class Campaign:
                 + "\n\n"
                 + self._sandbox_directive()
             )
-            recovery = run_session(
-                self.workspace,
+            recovery = self._run_agent_session(
                 recovery_prompt,
                 timeout=self.setup_timeout,
-                agent_cli=self.agent_cli,
-                sandbox_hardware=self.sandbox_hardware,
-                sandbox_profile=self.sandbox_profile,
-                sandbox_url=self.sandbox_url,
-                sandbox_timeout=self.sandbox_timeout,
                 reasoning_effort="high",
             )
             self._account(recovery, "setup recovery")
@@ -2202,14 +2222,9 @@ class Campaign:
 
         if action == "run":
             self._link_runtime()
-            res = run_session(
-                self.workspace, self._framework_baseline_prompt(n),
+            res = self._run_agent_session(
+                self._framework_baseline_prompt(n),
                 timeout=self.framework_baseline_timeout,
-                agent_cli=self.agent_cli,
-                sandbox_hardware=self.sandbox_hardware,
-                sandbox_profile=self.sandbox_profile,
-                sandbox_url=self.sandbox_url,
-                sandbox_timeout=self.sandbox_timeout,
                 reasoning_effort="high",
             )
             self._account(res, f"framework baseline v{n}")
@@ -2446,13 +2461,9 @@ class Campaign:
             + "\n\n"
             + self._sandbox_directive()
         )
-        recovery = run_session(
-            self.workspace, recovery_prompt, timeout=self.framework_baseline_timeout,
-            agent_cli=self.agent_cli,
-            sandbox_hardware=self.sandbox_hardware,
-            sandbox_profile=self.sandbox_profile,
-            sandbox_url=self.sandbox_url,
-            sandbox_timeout=self.sandbox_timeout,
+        recovery = self._run_agent_session(
+            recovery_prompt,
+            timeout=self.framework_baseline_timeout,
             reasoning_effort="high",
         )
         self._account(recovery, f"framework baseline recovery v{FRAMEWORK_BASELINE_VERSION}")
@@ -2774,13 +2785,9 @@ class Campaign:
             telemetry = (
                 None if do_convert else self._begin_iteration_telemetry(n, pre_head)
             )
-            res = run_session(
-                self.workspace, prompt, timeout=self.iter_timeout,
-                agent_cli=self.agent_cli,
-                sandbox_hardware=self.sandbox_hardware,
-                sandbox_profile=self.sandbox_profile,
-                sandbox_url=self.sandbox_url,
-                sandbox_timeout=self.sandbox_timeout,
+            res = self._run_agent_session(
+                prompt,
+                timeout=self.iter_timeout,
                 extra_environment=(telemetry.environment() if telemetry else None),
             )
             self._account(res, f"{'convert' if do_convert else 'iter'} v{n}")

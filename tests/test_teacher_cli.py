@@ -64,6 +64,7 @@ class TeacherCliTest(unittest.TestCase):
         self.assertEqual(request.shape_ratio, 1.10)
         self.assertEqual(request.framework_baseline, "always")
         self.assertEqual(request.convert_after, 0)
+        self.assertEqual(request.max_stall, 5)
         self.assertFalse(request.workload_bucketing)
         self.assertFalse(request.layer)
 

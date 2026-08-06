@@ -1,0 +1,420 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from orchestrator import optimize
+from teacher_distill.benchmark import (
+    MaterializedTeacherWorkspace,
+    TeacherBenchmarkResult,
+)
+from teacher_distill.campaign import TeacherDistillCampaign
+from teacher_distill.cli import TeacherDistillRequest
+from teacher_distill.knowledge_view import KnowledgeView
+from teacher_distill.models import CampaignTerminalStatus
+
+
+class FakeCandidate:
+    run_reason = "success: teacher ABBA passed (candidate/teacher 1.030)"
+    emit_violation = False
+    instances: list["FakeCandidate"] = []
+
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.workspace = Path(kwargs["work_dir"]) / (
+            "kernel_opt_%s_%s" % (kwargs["name"], kwargs["workspace_suffix"])
+        )
+        self.setup_calls = 0
+        self.baseline_calls = 0
+        self.run_calls = 0
+        FakeCandidate.instances.append(self)
+
+    @staticmethod
+    def _git(workspace: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=workspace, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    def setup_baseline(self) -> None:
+        self.setup_calls += 1
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        (self.workspace / "memory").mkdir(exist_ok=True)
+        (self.workspace / "kernel.py").write_text(
+            "import torch\ndef run(x, out): out[:] = torch.softmax(x, -1)\n",
+            encoding="utf-8",
+        )
+        (self.workspace / "README.md").write_text("# V0\n", encoding="utf-8")
+        (self.workspace / "memory/v0.json").write_text(
+            json.dumps(
+                {
+                    "version": "v0",
+                    "performance": {"latency_us": 300.0},
+                    "correctness": {"status": "PASS"},
+                    "quality_gate": {"result": "PASS"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._git(self.workspace, "init", "-q")
+        self._git(self.workspace, "config", "user.email", "test@local")
+        self._git(self.workspace, "config", "user.name", "test")
+        self._git(self.workspace, "add", "-A")
+        self._git(self.workspace, "commit", "-q", "-m", "v0")
+
+    def ensure_framework_baseline(self) -> None:
+        self.baseline_calls += 1
+        marker = self.workspace / optimize.FRAMEWORK_BASELINE_FILE
+        if marker.is_file():
+            return
+        (self.workspace / "kernel.py").write_text(
+            "import torch\nimport cutlass\nimport cutlass.cute as cute\n"
+            "@cute.kernel\ndef _kernel(x, out): return\n"
+            "def run(x, out): _kernel(x, out)\n",
+            encoding="utf-8",
+        )
+        (self.workspace / "memory/v1.json").write_text(
+            json.dumps(
+                {
+                    "version": "v1",
+                    "performance": {
+                        "latency_us": 180.0,
+                        "latency_us_by_shape": {"shape-a": 150.0, "shape-b": 216.0},
+                    },
+                    "correctness": {"status": "PASS"},
+                    "quality_gate": {"result": "PASS"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._git(self.workspace, "add", "kernel.py", "memory/v1.json")
+        self._git(self.workspace, "commit", "-q", "-m", "v1")
+        kernel_commit = self._git(self.workspace, "rev-parse", "HEAD")
+        kernel_blob = self._git(self.workspace, "rev-parse", "%s:kernel.py" % kernel_commit)
+        marker.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "version": "v1",
+                    "framework": "CuteDSL",
+                    "platform": "H20",
+                    "arch": "sm90",
+                    "commit": kernel_commit,
+                    "kernel_blob": kernel_blob,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._git(self.workspace, "add", marker.name)
+        self._git(self.workspace, "commit", "-q", "-m", "pin v1")
+
+    def run(self) -> str:
+        self.run_calls += 1
+        if self.emit_violation:
+            audit = self.kwargs["session_access_policy"].audit_log
+            audit.parent.mkdir(parents=True, exist_ok=True)
+            audit.write_text('{"reason":"forbidden"}\n', encoding="utf-8")
+        return self.run_reason
+
+
+class TeacherCampaignTest(unittest.TestCase):
+    def setUp(self) -> None:
+        FakeCandidate.instances.clear()
+        FakeCandidate.run_reason = "success: teacher ABBA passed (candidate/teacher 1.030)"
+        FakeCandidate.emit_violation = False
+
+    def _bundle(self, root: Path) -> Path:
+        bundle = root / "teacher"
+        (bundle / "helpers").mkdir(parents=True)
+        (bundle / "kernel.py").write_text(
+            "import torch\nimport cutlass\nimport cutlass.cute as cute\n"
+            "@cute.kernel\ndef _kernel(x, out): return\n"
+            "def run(x, out): _kernel(x, out)\n",
+            encoding="utf-8",
+        )
+        (bundle / "helpers/layout.py").write_text("TILE=128\n", encoding="utf-8")
+        (bundle / "solution.json").write_text(
+            json.dumps(
+                {
+                    "spec": {
+                        "languages": ["pytorch", "cutedsl"],
+                        "entry_point": "kernel.py::run",
+                        "dependencies": ["torch", "nvidia-cutlass-dsl"],
+                    },
+                    "sources": [
+                        {"path": "kernel.py"},
+                        {"path": "helpers/layout.py"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (bundle / "provenance.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "operator": {
+                        "canonical_id": "gdn_decode",
+                        "aliases": ["gdn", "gated_delta_rule"],
+                    },
+                    "source": {
+                        "project": "flashinfer",
+                        "revision": "abc123",
+                        "license": "Apache-2.0",
+                    },
+                    "target": {"framework": "CuteDSL", "architecture": "sm90"},
+                    "knowledge_deny": {
+                        "sources": ["flashinfer"],
+                        "paths": [],
+                        "tags": ["gdn", "gdn_decode"],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return bundle
+
+    def _op(self, root: Path) -> Path:
+        op = root / "op"
+        op.mkdir()
+        (op / "definition.json").write_text(
+            json.dumps({"name": "demo", "inputs": {"x": {}}, "outputs": {"out": {}}}),
+            encoding="utf-8",
+        )
+        (op / "reference.py").write_text("def run(x): return x\n", encoding="utf-8")
+        (op / "workload.jsonl").write_text(
+            json.dumps({"uuid": "shape-a"}) + "\n" + json.dumps({"uuid": "shape-b"}) + "\n",
+            encoding="utf-8",
+        )
+        return op
+
+    def _request(self, root: Path, *, shape_ratio: float = 1.10) -> TeacherDistillRequest:
+        op = self._op(root)
+        teacher = self._bundle(root)
+        return TeacherDistillRequest(
+            campaign_mode="teacher-distill",
+            name="gdn",
+            op_dir=op,
+            kernel_demo=op / "reference.py",
+            atrex_bench_root=None,
+            platform="H20",
+            architecture="sm90",
+            framework="CuteDSL",
+            teacher_solution=teacher,
+            private_root=root / "private",
+            workspace_root=root / "runs",
+            geomean_ratio=1.05,
+            shape_ratio=shape_ratio,
+            stall_before_episode=3,
+            partial_restarts=1,
+            optimization_mode="production",
+            framework_baseline="always",
+            convert_after=0,
+            workload_bucketing=False,
+            layer=False,
+            notes="none",
+            max_iters=10,
+            token_budget=0,
+            max_stall=5,
+            iter_timeout=10,
+            setup_timeout=10,
+            salvage_timeout=0,
+            framework_baseline_timeout=10,
+            sandbox_hardware="local",
+            sandbox_profile="",
+            sandbox_url="http://127.0.0.1:8000",
+            sandbox_timeout=60,
+            agent_cli="pi",
+        )
+
+    def _patch_dependencies(self, root: Path):
+        view_root = root / "sanitized-view"
+        view_root.mkdir(exist_ok=True)
+
+        def view(*_args, **_kwargs):
+            return KnowledgeView(view_root, "a" * 64, 10, 2)
+
+        def materialize(_bundle, _op, destination, **_kwargs):
+            workspace = Path(destination)
+            workspace.mkdir(parents=True, exist_ok=True)
+            (workspace / "kernel.py").write_text("# teacher\n", encoding="utf-8")
+            (workspace / "solution.json").write_text('{"sources":[{"path":"kernel.py"}]}', encoding="utf-8")
+            return MaterializedTeacherWorkspace(
+                workspace=workspace,
+                kind="sol",
+                expected_shape_keys=("shape-a", "shape-b"),
+                workload_hash="b" * 64,
+                evaluator_hash="c" * 64,
+                measurement_config_hash="d" * 64,
+            )
+
+        benchmark = TeacherBenchmarkResult(
+            geomean_latency_us=100.0,
+            latency_us_by_shape={"shape-a": 80.0, "shape-b": 125.0},
+            workload_hash="b" * 64,
+            evaluator_hash="c" * 64,
+            measurement_config_hash="d" * 64,
+        )
+        return (
+            mock.patch("teacher_distill.campaign.build_knowledge_view", side_effect=view),
+            mock.patch("teacher_distill.campaign.materialize_teacher_workspace", side_effect=materialize),
+            mock.patch("teacher_distill.campaign.benchmark_teacher", return_value=benchmark),
+            mock.patch("teacher_distill.campaign.optimize.Campaign", side_effect=FakeCandidate),
+        )
+
+    def test_fresh_campaign_locks_public_target_builds_v1_and_returns_success(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-campaign-") as temp_dir:
+            root = Path(temp_dir)
+            request = self._request(root)
+            patches = self._patch_dependencies(root)
+            with patches[0], patches[1], patches[2] as benchmark, patches[3]:
+                result = TeacherDistillCampaign(request).run()
+
+            candidate = FakeCandidate.instances[-1]
+            public_target = (candidate.workspace / "teacher_target.json").read_text(encoding="utf-8")
+            public_lock = (candidate.workspace / "campaign_lock.json").read_text(encoding="utf-8")
+            private_state = next(request.private_root.glob("campaign_*/private_config.json")).read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(result.status, CampaignTerminalStatus.SUCCESS)
+        self.assertEqual(candidate.setup_calls, 1)
+        self.assertGreaterEqual(candidate.baseline_calls, 1)
+        self.assertEqual(candidate.run_calls, 1)
+        benchmark.assert_called_once()
+        self.assertNotIn("flashinfer", public_target + public_lock)
+        self.assertNotIn(str(request.teacher_solution), public_target + public_lock)
+        self.assertIn("flashinfer", private_state)
+        self.assertIsNotNone(candidate.kwargs["stop_policy"])
+        self.assertIsNotNone(candidate.kwargs["session_access_policy"])
+        self.assertIn("hidden-audited", candidate.kwargs["session_directive"])
+
+    def test_resume_reuses_teacher_benchmark_and_revalidates_hashes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-campaign-resume-") as temp_dir:
+            root = Path(temp_dir)
+            request = self._request(root)
+            patches = self._patch_dependencies(root)
+            with patches[0], patches[1], patches[2] as benchmark, patches[3]:
+                first = TeacherDistillCampaign(request).run()
+                second = TeacherDistillCampaign(request).run()
+
+        self.assertEqual(first.status, CampaignTerminalStatus.SUCCESS)
+        self.assertEqual(second.status, CampaignTerminalStatus.SUCCESS)
+        benchmark.assert_called_once()
+        self.assertEqual(FakeCandidate.instances[0].setup_calls, 1)
+        self.assertEqual(FakeCandidate.instances[1].setup_calls, 0)
+
+    def test_changed_threshold_is_rejected_as_resume_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-campaign-mismatch-") as temp_dir:
+            root = Path(temp_dir)
+            request = self._request(root)
+            patches = self._patch_dependencies(root)
+            with patches[0], patches[1], patches[2], patches[3]:
+                TeacherDistillCampaign(request).run()
+                changed = TeacherDistillRequest(
+                    **{**request.__dict__, "shape_ratio": 1.20}
+                )
+                with self.assertRaisesRegex(RuntimeError, "RESUME_CONFIG_MISMATCH"):
+                    TeacherDistillCampaign(changed).run()
+
+    def test_audited_forbidden_access_overrides_an_apparent_success(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-campaign-leakage-") as temp_dir:
+            root = Path(temp_dir)
+            request = self._request(root)
+            patches = self._patch_dependencies(root)
+            FakeCandidate.emit_violation = True
+            with patches[0], patches[1], patches[2], patches[3]:
+                result = TeacherDistillCampaign(request).run()
+
+        self.assertEqual(result.status, CampaignTerminalStatus.TEACHER_LEAKAGE_VIOLATION)
+
+    def test_native_candidate_v0_is_materialized_without_an_agent_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-campaign-native-v0-") as temp_dir:
+            root = Path(temp_dir)
+            request = self._request(root)
+            native = root / "native"
+            native.mkdir()
+            reference = (
+                "import torch\nclass Model(torch.nn.Module):\n"
+                "    def forward(self, x): return torch.softmax(x, -1)\n"
+            )
+            (native / "reference.py").write_text(reference, encoding="utf-8")
+            (native / "input.py").write_text("def make_inputs(): return ()\n", encoding="utf-8")
+            (native / "shapes.json").write_text('{"0": {}, "1": {}}\n', encoding="utf-8")
+            (native / "metadata.json").write_text('{}\n', encoding="utf-8")
+            atrex = root / "atrex"
+            (atrex / "scripts").mkdir(parents=True)
+            (atrex / "scripts/run_eval.py").write_text("# eval\n", encoding="utf-8")
+            (atrex / "src/atrex_bench").mkdir(parents=True)
+            native_request = TeacherDistillRequest(
+                **{
+                    **request.__dict__,
+                    "op_dir": native,
+                    "kernel_demo": native / "reference.py",
+                    "atrex_bench_root": atrex,
+                }
+            )
+            supervisor = TeacherDistillCampaign(native_request)
+            candidate = optimize.Campaign(
+                name=native_request.name,
+                kernel_demo=str(native_request.kernel_demo),
+                platform="H20",
+                framework="CuteDSL",
+                arch="sm90",
+                work_dir=str(native_request.workspace_root),
+                workspace_suffix=optimize.framework_workspace_suffix(
+                    "CuteDSL", "H20", "production"
+                ),
+                optimization_mode="production",
+                runtime_linker=lambda _campaign: None,
+                atrex_bench_root=str(atrex),
+            )
+            result = {
+                "all_pass": True,
+                "latency_us_geomean": 200.0,
+                "latency_us_arith_mean": 210.0,
+                "latency_us_by_shape": {"0": 190.0, "1": 221.0},
+                "max_abs_err": 0.0,
+                "max_rel_err": 0.0,
+            }
+            completed = subprocess.CompletedProcess(
+                args=["sandbox"],
+                returncode=0,
+                stdout=optimize.TEST_RESULT_PREFIX + json.dumps(result) + "\n",
+                stderr="",
+            )
+            with (
+                mock.patch.object(optimize, "_sandbox_command", return_value=completed) as sandbox,
+                mock.patch.object(optimize, "run_session") as agent,
+            ):
+                supervisor._setup_native_reference_v0(candidate)
+
+            self.assertEqual(sandbox.call_count, 2)
+            agent.assert_not_called()
+            self.assertEqual(optimize.latest_version(candidate.workspace), 0)
+            self.assertEqual((candidate.workspace / "kernel.py").read_text(encoding="utf-8"), reference)
+            self.assertEqual(
+                json.loads((candidate.workspace / "memory/v0.json").read_text(encoding="utf-8"))[
+                    "optimization"
+                ]["action_category"],
+                "baseline",
+            )
+
+    def test_terminal_reason_mapping_is_explicit(self) -> None:
+        cases = {
+            "success: teacher ABBA passed (candidate/teacher 1.0)": CampaignTerminalStatus.SUCCESS,
+            "stall: 5 iterations with no commit": CampaignTerminalStatus.PLATEAU,
+            "budget: max-iters": CampaignTerminalStatus.BUDGET_EXHAUSTED,
+            "infra: endpoint unavailable": CampaignTerminalStatus.INFRA_ERROR,
+            "TEACHER_LEAKAGE_VIOLATION: blocked": CampaignTerminalStatus.TEACHER_LEAKAGE_VIOLATION,
+        }
+        for reason, expected in cases.items():
+            with self.subTest(reason=reason):
+                self.assertEqual(TeacherDistillCampaign._status_from_reason(reason), expected)
+
+
+if __name__ == "__main__":
+    unittest.main()

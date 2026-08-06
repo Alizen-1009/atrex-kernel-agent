@@ -63,9 +63,9 @@ Implementation must follow TDD: add a failing behavior test before each producti
 
 ## Phase 4 — Complete Teacher campaign and bounded exploration
 
-- [ ] **Task 11:** Implement `TeacherDistillCampaign` setup, resume locks, loop wiring, and terminal statuses.
+- [x] **Task 11:** Implement `TeacherDistillCampaign` setup, resume locks, loop wiring, and terminal statuses.
   - Depends on: Tasks 6–10
-  - Verify: `python -m unittest teacher_distill.tests.test_campaign -v`
+  - Verified: `python3.12 -m unittest teacher_distill.tests.test_campaign teacher_distill.tests.test_stop_policy tests.test_campaign_runtime_binding tests.test_framework_baseline -v`
 - [ ] **Task 12:** Add one bounded long-horizon episode after stalls and one partial restart.
   - Depends on: Task 11
   - Verify: `python -m unittest teacher_distill.tests.test_escalation long_horizon.tests.test_campaign long_horizon.tests.test_git_episode -v`
