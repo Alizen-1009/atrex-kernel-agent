@@ -6,7 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import main_adapter
 from .git_episode import (
@@ -70,6 +70,7 @@ class LongHorizonCampaign:
     verifier: GatewayABBAValidator | None = None
     session_runner: LongSessionRunner | None = None
     worktree_root: Path | None = None
+    episode_runtime_linker: Callable[[main_adapter.Campaign, Path], None] | None = None
 
     @property
     def workspace(self) -> Path:
@@ -103,7 +104,7 @@ class LongHorizonCampaign:
     ) -> str:
         directives = main_adapter.episode_directives(self.base_campaign)
         journal_command = f"PYTHONPATH={MODULE_ROOT} python -m long_horizon.journal"
-        return _render(
+        prompt = _render(
             PROMPT_PATH.read_text(encoding="utf-8"),
             {
                 "EPISODE": episode,
@@ -136,6 +137,8 @@ class LongHorizonCampaign:
                 ),
             },
         )
+        directive = str(getattr(self.base_campaign, "session_directive", "") or "")
+        return directive.rstrip() + "\n\n" + prompt if directive else prompt
 
     def _completion_check(
         self,
@@ -651,7 +654,10 @@ class LongHorizonCampaign:
                 }
             )
             store.save_active(active)
-            main_adapter.link_episode_runtime(self.base_campaign, worktree.path)
+            if self.episode_runtime_linker is not None:
+                self.episode_runtime_linker(self.base_campaign, worktree.path)
+            else:
+                main_adapter.link_episode_runtime(self.base_campaign, worktree.path)
             unexpected = working_changes(worktree.path)
             if unexpected:
                 raise RuntimeError(
