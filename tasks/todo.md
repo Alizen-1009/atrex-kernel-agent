@@ -93,9 +93,9 @@ Implementation must follow TDD: add a failing behavior test before each producti
 
 - [x] **Task 16:** Add docs, CLI examples, minimal fixtures, and mocked end-to-end test.
   - Depends on: Tasks 1–15
-- [ ] Run: `python -m unittest discover -s tests -v` — executed with Python 3.12; feature tests pass, but the base suite has two pre-existing assertion failures and lacks Torch in this local interpreter.
-- [x] Run: `python3.12 -m unittest discover -s long_horizon/tests -v` — 48 passed after wrapper compatibility guard.
-- [x] Run: `python3.12 -m unittest discover -s teacher_distill/tests -v` — 77 passed after final hardening.
+- [ ] Run: `python -m unittest discover -s tests -v` — 166 tests ran; the feature tests pass, while upstream/main independently reproduces the two assertion failures (`test_local_gateway`, `test_optimize_dispatch`) and this interpreter lacks Torch for `test_aggregate_dispatch`.
+- [x] Run: `python3.12 -m unittest discover -s long_horizon/tests -v` — 57 passed after rebasing onto upstream/main.
+- [x] Run: `python3.12 -m unittest discover -s teacher_distill/tests -v` — 94 passed after final isolation and verification hardening.
 - [x] Run: `python3.12 -m unittest gpu-wiki/scripts/test_query.py -v` — 48 passed.
 - [x] Run: `python3.12 -m unittest gpu-wiki/scripts/test_check_self_contained.py -v` — 47 passed.
 - [x] Run: `git diff --check`.

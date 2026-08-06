@@ -24,6 +24,8 @@ class EvidenceBuilderTest(unittest.TestCase):
             workspace / "plans",
             workspace / "profiles/v1",
             private / "teacher_workspace/aggregate_kernels/.atrex_teacher_verify/run1",
+            private / "teacher_workspace/aggregate_kernels/.atrex_teacher_verify/run2",
+            workspace / ".atrex_long_horizon/episodes/e0001/archive",
         ):
             directory.mkdir(parents=True, exist_ok=True)
         (workspace / "kernel.py").write_text("# v0\n", encoding="utf-8")
@@ -97,6 +99,21 @@ class EvidenceBuilderTest(unittest.TestCase):
             json.dumps({"schema_version": 1, "runs": [], "error": None}),
             encoding="utf-8",
         )
+        verified_abba = private / "teacher_workspace/aggregate_kernels/.atrex_teacher_verify/run2/result.json"
+        verified_abba.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "verification_status": "PASS",
+                    "candidate_to_teacher_ratio": 1.03,
+                    "payload": {"schema_version": 1, "runs": [], "error": None},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (workspace / ".atrex_long_horizon/episodes/e0001/archive/candidate.patch").write_text(
+            "private checkpoint patch\n", encoding="utf-8"
+        )
         return workspace, private
 
     def test_builder_is_deterministic_and_classifies_evidence(self) -> None:
@@ -122,7 +139,17 @@ class EvidenceBuilderTest(unittest.TestCase):
         self.assertFalse(by_id["E-V3-MEMORY"]["citable_as_verified"])
         self.assertIn("E-V1-PLAN", by_id)
         self.assertIn("E-V1-PROFILE", by_id)
-        self.assertTrue(any(key.startswith("E-ABBA-") for key in by_id))
+        abba_rows = [entry for key, entry in by_id.items() if key.startswith("E-ABBA-")]
+        self.assertEqual(len(abba_rows), 2)
+        self.assertEqual(
+            sorted(row["citable_as_verified"] for row in abba_rows),
+            [False, True],
+        )
+        checkpoint_rows = [
+            entry for key, entry in by_id.items() if key.startswith("E-EPISODE-CHECKPOINT-")
+        ]
+        self.assertTrue(checkpoint_rows)
+        self.assertTrue(all(not row["citable_as_verified"] for row in checkpoint_rows))
         self.assertEqual([row["version"] for row in trajectory["versions"]], ["v0", "v1", "v2", "v3"])
         self.assertEqual(trajectory["versions"][1]["latency_us"], 150.0)
         self.assertEqual(trajectory["versions"][1]["teacher_ratio"], 1.20)

@@ -78,7 +78,14 @@ def score_teacher_abba_payload(
         result = row.get("result")
         if revision not in geomeans:
             return _error(AbbaStatus.INFRA_ERROR, "ABBA result has an unknown revision", rows)
-        if row.get("exit_code") != 0 or not isinstance(result, dict) or not result.get("all_pass"):
+        exit_code = row.get("exit_code")
+        if exit_code == -1 or not isinstance(result, dict):
+            return _error(
+                AbbaStatus.INFRA_ERROR,
+                "authoritative ABBA run did not execute to a structured result",
+                rows,
+            )
+        if exit_code != 0 or not result.get("all_pass"):
             return _error(AbbaStatus.FAIL, "not every authoritative ABBA run passed correctness", rows)
         geomean = result.get("latency_us_geomean")
         by_shape = result.get("latency_us_by_shape")
@@ -294,7 +301,15 @@ class TeacherABBAValidator:
             "schema_version": 1,
             "schedule": schedule,
             "manifests": manifests,
-            "command": ["python3", "test_kernel.py", "--version", "vteacher-abba", "--no-memory"],
+            "command": [
+                "python3",
+                "test_kernel.py",
+                "--version",
+                "vteacher-abba",
+                "--no-memory",
+                "--multi-seed",
+                "5",
+            ],
             "run_timeout_seconds": self.per_run_timeout,
         }
         (private_workspace / request_relative).write_text(
@@ -324,10 +339,6 @@ class TeacherABBAValidator:
         except ValueError as exc:
             return _error(AbbaStatus.INFRA_ERROR, str(exc))
         artifact = private_workspace / result_relative
-        artifact.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
         result = score_teacher_abba_payload(
             payload,
             schedule=schedule,
@@ -336,5 +347,23 @@ class TeacherABBAValidator:
             geomean_ratio=self.geomean_ratio,
             shape_ratio=self.shape_ratio,
             artifact=str(artifact),
+        )
+        artifact.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "verification_status": result.status.value,
+                    "candidate_to_teacher_ratio": result.candidate_to_teacher_ratio,
+                    "worst_shape_ratio": result.worst_shape_ratio,
+                    "worst_shape_key": result.worst_shape_key,
+                    "error": result.error,
+                    "payload": payload,
+                },
+                indent=2,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
         )
         return result

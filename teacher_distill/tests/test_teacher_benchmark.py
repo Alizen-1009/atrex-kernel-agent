@@ -195,6 +195,56 @@ class TeacherBenchmarkTest(unittest.TestCase):
             self.assertTrue((workspace / "atrex-bench").is_symlink())
             self.assertEqual((workspace / "atrex-bench").resolve(), atrex.resolve())
 
+    def test_measurement_context_changes_the_config_hash(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-benchmark-context-") as temp_dir:
+            root = Path(temp_dir)
+            bundle = self._bundle(root)
+            op = self._sol_op(root)
+            first = materialize_teacher_workspace(
+                bundle,
+                op,
+                root / "first",
+                framework="CuteDSL",
+                measurement_context={"sandbox_hardware": "gpu-a", "architecture": "sm90"},
+            )
+            second = materialize_teacher_workspace(
+                bundle,
+                op,
+                root / "second",
+                framework="CuteDSL",
+                measurement_context={"sandbox_hardware": "gpu-b", "architecture": "sm90"},
+            )
+
+        self.assertNotEqual(
+            first.measurement_config_hash,
+            second.measurement_config_hash,
+        )
+
+    def test_native_evaluator_hash_covers_imported_package_sources(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-benchmark-evaluator-hash-") as temp_dir:
+            root = Path(temp_dir)
+            bundle = self._bundle(root, entry_point="kernel.py::Model")
+            op, atrex = self._native_op(root)
+            package_source = atrex / "src/atrex_bench/core.py"
+            package_source.write_text("VALUE = 1\n", encoding="utf-8")
+            first = materialize_teacher_workspace(
+                bundle,
+                op,
+                root / "first",
+                framework="CuteDSL",
+                atrex_bench_root=atrex,
+            )
+            package_source.write_text("VALUE = 2\n", encoding="utf-8")
+            second = materialize_teacher_workspace(
+                bundle,
+                op,
+                root / "second",
+                framework="CuteDSL",
+                atrex_bench_root=atrex,
+            )
+
+        self.assertNotEqual(first.evaluator_hash, second.evaluator_hash)
+
     def test_evaluator_kind_rejects_the_wrong_entry_point_contract(self) -> None:
         with tempfile.TemporaryDirectory(prefix="teacher-benchmark-entry-") as temp_dir:
             root = Path(temp_dir)

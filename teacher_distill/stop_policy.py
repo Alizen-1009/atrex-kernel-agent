@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -14,6 +15,7 @@ from orchestrator.stop_policy import StopDecision, StopDecisionStatus
 from .abba import TeacherABBAResult
 from .benchmark import MaterializedTeacherWorkspace
 from .models import AbbaStatus, TeacherProgress, TeacherTarget
+from .state import read_json_object, write_json_atomic
 
 
 class TeacherVerifier(Protocol):
@@ -84,6 +86,92 @@ class TeacherStopPolicy:
         )
 
     @staticmethod
+    def _git_bytes(workspace: Path, commit: str, relative: str) -> bytes | None:
+        process = subprocess.run(
+            ["git", "show", f"{commit}:{relative}"],
+            cwd=workspace,
+            capture_output=True,
+            check=False,
+        )
+        if process.returncode == 0:
+            return process.stdout
+        path = workspace / relative
+        return path.read_bytes() if path.is_file() else None
+
+    def candidate_fingerprint(self, workspace: Path, commit: str) -> str:
+        solution = self._git_bytes(workspace, commit, "solution.json")
+        paths = {"kernel.py", "solution.json"}
+        if solution is not None:
+            try:
+                value = json.loads(solution.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                value = {}
+            sources = value.get("sources") if isinstance(value, dict) else None
+            if isinstance(sources, list):
+                for source in sources:
+                    relative = source.get("path") if isinstance(source, dict) else None
+                    if (
+                        isinstance(relative, str)
+                        and relative
+                        and not relative.startswith("/")
+                        and "\\" not in relative
+                        and ".." not in Path(relative).parts
+                    ):
+                        paths.add(relative)
+        digest = hashlib.sha256()
+        for relative in sorted(paths):
+            content = self._git_bytes(workspace, commit, relative)
+            if content is None:
+                continue
+            encoded = relative.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
+        return digest.hexdigest()
+
+    def _verification_path(self, fingerprint: str) -> Path:
+        return self.teacher.workspace.parent / "abba_verifications" / (fingerprint + ".json")
+
+    def _load_private_verification(self, fingerprint: str) -> dict | None:
+        path = self._verification_path(fingerprint)
+        if not path.is_file():
+            return None
+        try:
+            value = read_json_object(path, "private Teacher ABBA verification")
+        except (OSError, ValueError):
+            return None
+        if (
+            value.get("schema_version") != 1
+            or value.get("candidate_fingerprint") != fingerprint
+            or value.get("target_id") != self.target.teacher_id
+            or value.get("measurement_config_hash") != self.target.measurement_config_hash
+        ):
+            return None
+        return value
+
+    def _save_private_verification(
+        self,
+        fingerprint: str,
+        verification: TeacherABBAResult,
+    ) -> None:
+        write_json_atomic(
+            self._verification_path(fingerprint),
+            {
+                "schema_version": 1,
+                "candidate_fingerprint": fingerprint,
+                "target_id": self.target.teacher_id,
+                "measurement_config_hash": self.target.measurement_config_hash,
+                "status": verification.status.value,
+                "candidate_to_teacher_ratio": verification.candidate_to_teacher_ratio,
+                "worst_shape_ratio": verification.worst_shape_ratio,
+                "worst_shape_key": verification.worst_shape_key,
+                "artifact": verification.artifact,
+                "error": verification.error,
+            },
+        )
+
+    @staticmethod
     def _persist(workspace: Path, version: int, memory: dict, progress: TeacherProgress) -> None:
         memory["teacher_progress"] = progress.to_mapping()
         path = workspace / "memory" / ("v%d.json" % version)
@@ -112,12 +200,37 @@ class TeacherStopPolicy:
             ).returncode
             if changed != 0:
                 subprocess.run(
-                    ["git", "commit", "-m", "v%d: record Teacher progress" % version],
+                    [
+                        "git",
+                        "commit",
+                        "--only",
+                        "-m",
+                        "v%d: record Teacher progress" % version,
+                        "--",
+                        relative,
+                    ],
                     cwd=workspace,
                     check=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+
+    def record_measured_iteration(
+        self,
+        campaign: optimize.Campaign,
+        version: int,
+        memory: dict,
+        *,
+        accepted: bool,
+    ) -> None:
+        progress = self._candidate_progress(memory)
+        if not accepted:
+            progress = replace(
+                progress,
+                abba_status=AbbaStatus.NOT_RUN,
+                final_candidate_to_teacher_ratio=None,
+            )
+        self._persist(campaign.workspace, version, memory, progress)
 
     def evaluate_accepted_iteration(
         self,
@@ -138,6 +251,32 @@ class TeacherStopPolicy:
                 StopDecisionStatus.INFRA_ERROR,
                 "Teacher ABBA cannot run without a committed Candidate",
             )
+        fingerprint = self.candidate_fingerprint(campaign.workspace, candidate_commit)
+        private_verification = self._load_private_verification(fingerprint)
+        if private_verification is not None and private_verification.get("status") in {
+            AbbaStatus.PASS.value,
+            AbbaStatus.FAIL.value,
+        }:
+            private_status = AbbaStatus(private_verification["status"])
+            private_ratio = private_verification.get("candidate_to_teacher_ratio")
+            verified = replace(
+                progress,
+                abba_status=private_status,
+                final_candidate_to_teacher_ratio=(
+                    float(private_ratio)
+                    if isinstance(private_ratio, (int, float))
+                    and not isinstance(private_ratio, bool)
+                    else None
+                ),
+            )
+            self._persist(campaign.workspace, version, memory, verified)
+            if private_status == AbbaStatus.PASS:
+                return StopDecision(
+                    StopDecisionStatus.SUCCESS,
+                    "success: teacher ABBA passed (candidate/teacher %.3f)"
+                    % (verified.final_candidate_to_teacher_ratio or 0.0),
+                )
+            return StopDecision.continue_()
         try:
             verification = self.verifier.verify(
                 candidate_workspace=campaign.workspace,
@@ -155,6 +294,7 @@ class TeacherStopPolicy:
                 error="%s: %s" % (type(exc).__name__, exc),
             )
 
+        self._save_private_verification(fingerprint, verification)
         verified = TeacherProgress(
             target_id=progress.target_id,
             candidate_to_teacher_geomean_ratio=progress.candidate_to_teacher_geomean_ratio,

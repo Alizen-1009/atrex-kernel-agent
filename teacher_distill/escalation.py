@@ -15,6 +15,7 @@ from orchestrator.agent_runtime.process import (
     register_access_policy,
     unregister_access_policy,
 )
+from orchestrator.agent_runtime.runtime import restrict_network_tools
 from orchestrator.optimization_policy import install_workspace_policy
 from orchestrator.stop_policy import StopDecisionStatus
 
@@ -31,8 +32,9 @@ class EpisodeRunner(Protocol):
 
 
 class _TeacherPolicyExecutor:
-    def __init__(self, access_policy: ProcessAccessPolicy) -> None:
+    def __init__(self, access_policy: ProcessAccessPolicy, agent_cli: str) -> None:
         self.access_policy = access_policy
+        self.agent_cli = agent_cli
 
     def __call__(
         self,
@@ -46,7 +48,7 @@ class _TeacherPolicyExecutor:
         scoped_environment[ACCESS_POLICY_ENV] = policy_id
         try:
             return optimize._run_bounded(
-                command,
+                restrict_network_tools(command, self.agent_cli),
                 workspace,
                 timeout,
                 scoped_environment,
@@ -69,7 +71,7 @@ class LongHorizonEpisodeRunner:
         before_blob = optimize.git_kernel_blob(candidate.workspace)
         access_policy = self.session_policy.process_access_policy()
         session_runner = LongSessionRunner(
-            executor=_TeacherPolicyExecutor(access_policy),
+            executor=_TeacherPolicyExecutor(access_policy, candidate.agent_cli),
             agent_cli=candidate.agent_cli,
         )
 
@@ -98,8 +100,10 @@ class LongHorizonEpisodeRunner:
             episode_limit=1,
             session_timeout=max(candidate.iter_timeout, 18_000),
             handoff_resumes=2,
+            blocked_retry_limit=0,
             session_runner=session_runner,
             worktree_root=worktree_root,
+            store_root=self.private_dir / "long_horizon",
             episode_runtime_linker=link_episode_runtime,
         )
         supervisor.run()
@@ -188,6 +192,8 @@ class TeacherEscalationManager:
                 "partial_restarts_used": 0,
                 "masked_versions": [],
                 "last_episode_promoted": None,
+                "phase": "pending",
+                "last_reason": None,
             }
         state = read_json_object(self.state_path, "Teacher escalation state")
         if state.get("schema_version") != 1:
@@ -197,21 +203,32 @@ class TeacherEscalationManager:
     def _save(self, state: dict) -> None:
         write_json_atomic(self.state_path, state)
 
+    def _complete(self, state: dict, reason: str) -> str:
+        state["phase"] = "complete"
+        state["last_reason"] = reason
+        self._save(state)
+        return reason
+
     def continue_after_stall(self, candidate: optimize.Campaign, reason: str) -> str:
         if not reason.startswith("stall:"):
             return reason
         state = self._load()
-        if int(state.get("episodes_used", 0)) >= 1:
-            return reason
+        state.setdefault("trigger_reason", reason)
+        if state.get("phase") == "complete":
+            stored = state.get("last_reason")
+            return str(stored) if isinstance(stored, str) and stored else reason
 
-        promoted = False
-        try:
-            promoted = bool(self.episode_runner.run(candidate))
-        finally:
-            state["episodes_used"] = int(state.get("episodes_used", 0)) + 1
-            state["last_episode_promoted"] = promoted
-            self._save(state)
+        if int(state.get("episodes_used", 0)) < 1:
+            promoted = False
+            try:
+                promoted = bool(self.episode_runner.run(candidate))
+            finally:
+                state["episodes_used"] = int(state.get("episodes_used", 0)) + 1
+                state["last_episode_promoted"] = promoted
+                state["phase"] = "episode_complete"
+                self._save(state)
 
+        promoted = bool(state.get("last_episode_promoted", False))
         candidate.max_stall = self.final_max_stall
         optimize.write_stall(candidate.workspace, 0)
         if promoted:
@@ -220,16 +237,22 @@ class TeacherEscalationManager:
             if memory and hasattr(candidate, "_accepted_stop_decision"):
                 decision = candidate._accepted_stop_decision(latest, memory)
                 if decision.status == StopDecisionStatus.SUCCESS:
-                    return decision.reason
+                    return self._complete(state, decision.reason)
                 candidate._report_stop_policy_infra_error(decision)
-            return candidate.run()
+            state["phase"] = "continuing"
+            self._save(state)
+            return self._complete(state, candidate.run())
 
         restarts_used = int(state.get("partial_restarts_used", 0))
+        if state.get("phase") == "continuing":
+            optimize.write_stall(candidate.workspace, 0)
+            return self._complete(state, candidate.run())
         if restarts_used >= self.partial_restart_limit:
-            return reason
+            return self._complete(state, reason)
         masked = mask_half_for_partial_restart(candidate.workspace)
         state["partial_restarts_used"] = restarts_used + 1
         state["masked_versions"] = [*state.get("masked_versions", []), *masked]
+        state["phase"] = "continuing"
         self._save(state)
         optimize.write_stall(candidate.workspace, 0)
-        return candidate.run()
+        return self._complete(state, candidate.run())

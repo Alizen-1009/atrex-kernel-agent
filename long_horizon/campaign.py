@@ -66,10 +66,12 @@ class LongHorizonCampaign:
     token_budget: int = 0
     session_timeout: int = 18_000
     handoff_resumes: int = 2
+    blocked_retry_limit: int = 1
     max_stall: int = 0
     verifier: GatewayABBAValidator | None = None
     session_runner: LongSessionRunner | None = None
     worktree_root: Path | None = None
+    store_root: Path | None = None
     episode_runtime_linker: Callable[[main_adapter.Campaign, Path], None] | None = None
 
     @property
@@ -137,8 +139,15 @@ class LongHorizonCampaign:
                 ),
             },
         )
-        directive = str(getattr(self.base_campaign, "session_directive", "") or "")
-        return directive.rstrip() + "\n\n" + prompt if directive else prompt
+        prompt_filter = getattr(self.base_campaign, "session_prompt_filter", None)
+        filtered = callable(prompt_filter)
+        if filtered:
+            prompt = prompt_filter(prompt)
+        directive = str(getattr(self.base_campaign, "session_directive", "") or "").rstrip()
+        if not directive:
+            return prompt
+        rendered = directive + "\n\n" + prompt
+        return rendered.rstrip() + "\n\n" + directive if filtered else rendered
 
     def _completion_check(
         self,
@@ -497,8 +506,12 @@ class LongHorizonCampaign:
                             "episode_branch": branch,
                             "outcome_commit": git_head(self.workspace),
                             "recovered_after_supervisor_interruption": True,
-                            "blocked_retry_scheduled": retry_of is None,
-                            "blocked_terminal": retry_of is not None,
+                            "blocked_retry_scheduled": (
+                                self.blocked_retry_limit > 0 and retry_of is None
+                            ),
+                            "blocked_terminal": (
+                                self.blocked_retry_limit <= 0 or retry_of is not None
+                            ),
                         }
                         if retry_of is not None:
                             recovered_attempt["blocked_retry_of_episode"] = retry_of.get(
@@ -558,7 +571,7 @@ class LongHorizonCampaign:
 
     def run(self) -> str:
         main_adapter.prepare_campaign(self.base_campaign)
-        store = CampaignStore(self.workspace)
+        store = CampaignStore(self.workspace, self.store_root)
         state = store.load_state()
         if state.episodes == 0 and state.consecutive_without_promotion == 0:
             state.consecutive_without_promotion = main_adapter.restored_stall(self.workspace)
@@ -812,7 +825,10 @@ class LongHorizonCampaign:
             valid_blocked = status == "blocked" and not violation
             if valid_blocked:
                 retry_of = state.attempts[-1] if self._blocked_retry_pending(state) else None
-                if retry_of is None:
+                if self.blocked_retry_limit <= 0:
+                    attempt["blocked_retry_scheduled"] = False
+                    attempt["blocked_terminal"] = True
+                elif retry_of is None:
                     attempt["blocked_retry_scheduled"] = True
                     attempt["blocked_terminal"] = False
                 else:

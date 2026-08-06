@@ -131,6 +131,8 @@ class LongHorizonEpisodeRunnerTest(unittest.TestCase):
         self.assertTrue(promoted)
         self.assertEqual(captured["episode_limit"], 1)
         self.assertEqual(captured["max_episodes"], 1)
+        self.assertEqual(captured["blocked_retry_limit"], 0)
+        self.assertEqual(captured["store_root"], (root / "private/long_horizon").resolve())
         self.assertIsNotNone(captured["session_runner"])
         self.assertIsNotNone(captured["episode_runtime_linker"])
 
@@ -216,6 +218,46 @@ class TeacherEscalationManagerTest(unittest.TestCase):
 
         self.assertEqual(reason, "success: teacher ABBA passed after long episode")
         self.assertEqual(candidate.run_calls, 0)
+
+    def test_resume_continues_post_episode_phase_without_second_episode(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-escalation-phase-resume-") as temp_dir:
+            root = Path(temp_dir)
+            workspace = _workspace(root)
+            private = root / "private"
+            private.mkdir()
+            (private / "escalation_state.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "episodes_used": 1,
+                        "partial_restarts_used": 0,
+                        "masked_versions": [],
+                        "last_episode_promoted": False,
+                        "phase": "episode_complete",
+                        "last_reason": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runner = FakeEpisodeRunner(promoted=False)
+            candidate = FakeCandidate(workspace, ["budget: max-iters"])
+            manager = TeacherEscalationManager(
+                private_dir=private,
+                episode_runner=runner,
+                partial_restart_limit=1,
+                final_max_stall=5,
+            )
+
+            reason = manager.continue_after_stall(
+                candidate, "stall: 3 iterations with no commit"
+            )
+            state = json.loads((private / "escalation_state.json").read_text())
+
+        self.assertEqual(reason, "budget: max-iters")
+        self.assertEqual(runner.calls, 0)
+        self.assertEqual(candidate.run_calls, 1)
+        self.assertEqual(candidate.max_stall, 5)
+        self.assertEqual(state["phase"], "complete")
 
     def test_resume_never_runs_more_than_one_episode_or_restart(self) -> None:
         with tempfile.TemporaryDirectory(prefix="teacher-escalation-resume-") as temp_dir:

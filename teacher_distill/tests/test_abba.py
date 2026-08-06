@@ -105,6 +105,31 @@ class TeacherABBAScoringTest(unittest.TestCase):
         self.assertGreater(result.worst_shape_ratio, 1.10)
         self.assertIn("shape ratio", result.error)
 
+    def test_timeout_or_missing_result_is_infrastructure_error(self) -> None:
+        payload = _payload(
+            teacher=(
+                _result(100.0, {"a": 100.0}),
+                _result(100.0, {"a": 100.0}),
+            ),
+            candidate=(
+                _result(100.0, {"a": 100.0}),
+                _result(100.0, {"a": 100.0}),
+            ),
+        )
+        payload["runs"][1]["exit_code"] = -1
+        payload["runs"][1]["result"] = None
+        result = score_teacher_abba_payload(
+            payload,
+            schedule=verification_schedule(2),
+            repeats=2,
+            expected_shape_keys=("a",),
+            geomean_ratio=1.05,
+            shape_ratio=1.10,
+        )
+
+        self.assertEqual(result.status, AbbaStatus.INFRA_ERROR)
+        self.assertIn("execute", result.error)
+
     def test_correctness_failure_is_fail_but_malformed_schedule_is_infra_error(self) -> None:
         correctness = _payload(
             teacher=(
@@ -195,6 +220,7 @@ class TeacherABBAValidatorTest(unittest.TestCase):
                 request_path = workspace / command[-2]
                 request = json.loads(request_path.read_text(encoding="utf-8"))
                 self.assertEqual(request["schedule"], verification_schedule(2))
+                self.assertEqual(request["command"][-2:], ["--multi-seed", "5"])
                 self.assertEqual(set(request["manifests"]), {"incumbent", "candidate"})
                 for manifest in request["manifests"].values():
                     for source in manifest.values():

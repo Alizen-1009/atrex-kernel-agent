@@ -63,6 +63,16 @@ def _hash_named_bytes(values: list[tuple[str, bytes]]) -> str:
     return digest.hexdigest()
 
 
+def _directory_hash_values(root: Path, prefix: str) -> list[tuple[str, bytes]]:
+    values: list[tuple[str, bytes]] = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root)
+        if "__pycache__" in relative.parts or path.suffix in {".pyc", ".pyo"}:
+            continue
+        values.append((f"{prefix}/{relative.as_posix()}", path.read_bytes()))
+    return values
+
+
 def _copy_files(source: Path, destination: Path, names: tuple[str, ...]) -> None:
     for name in names:
         path = source / name
@@ -108,6 +118,7 @@ def materialize_teacher_workspace(
     *,
     framework: str,
     atrex_bench_root: Path | str | None = None,
+    measurement_context: Mapping[str, object] | None = None,
 ) -> MaterializedTeacherWorkspace:
     """Create a private evaluator-faithful Teacher workspace without executing code."""
     if not isinstance(bundle, ValidatedTeacherBundle):
@@ -162,6 +173,7 @@ def materialize_teacher_workspace(
         evaluator_values = [
             ("test_kernel.py", (workspace / "test_kernel.py").read_bytes()),
             ("atrex-bench/scripts/run_eval.py", evaluator.read_bytes()),
+            *_directory_hash_values(package, "atrex-bench/src/atrex_bench"),
         ]
     else:
         raise ValueError("operator is neither SOL nor native Atrex-Bench format")
@@ -195,6 +207,7 @@ def materialize_teacher_workspace(
             "benchmark": ["python", "test_kernel.py", "--version", "vteacher", "--no-memory"],
         },
         "config": SOL_CONFIG if kind == "sol" else {"canonical_atrex_bench": True},
+        "runtime_context": dict(measurement_context or {}),
     }
     measurement_config_hash = hashlib.sha256(
         canonical_json(measurement_contract).encode("utf-8")

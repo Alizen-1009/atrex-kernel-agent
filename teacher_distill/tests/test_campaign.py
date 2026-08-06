@@ -28,6 +28,7 @@ class FakeCandidate:
         self.workspace = Path(kwargs["work_dir"]) / (
             "kernel_opt_%s_%s" % (kwargs["name"], kwargs["workspace_suffix"])
         )
+        self.stop_policy = kwargs.get("stop_policy")
         self.setup_calls = 0
         self.baseline_calls = 0
         self.run_calls = 0
@@ -277,8 +278,24 @@ class TeacherCampaignTest(unittest.TestCase):
             candidate = FakeCandidate.instances[-1]
             public_target = (candidate.workspace / "teacher_target.json").read_text(encoding="utf-8")
             public_lock = (candidate.workspace / "campaign_lock.json").read_text(encoding="utf-8")
-            private_state = next(request.private_root.glob("campaign_*/private_config.json")).read_text(
-                encoding="utf-8"
+            private_state_path = next(
+                request.private_root.glob("campaign_*/private_config.json")
+            )
+            private_state = private_state_path.read_text(encoding="utf-8")
+            incumbent = json.loads(
+                (private_state_path.parent / "candidate_incumbent.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            rejection = candidate.kwargs["iteration_acceptance"](
+                candidate,
+                2,
+                {
+                    "performance": {"latency_us": incumbent["latency_us"] + 1.0},
+                    "correctness": {"status": "PASS"},
+                    "quality_gate": {"result": "PASS"},
+                },
+                None,
             )
 
         self.assertEqual(result.status, CampaignTerminalStatus.SUCCESS)
@@ -291,6 +308,14 @@ class TeacherCampaignTest(unittest.TestCase):
         self.assertIn("flashinfer", private_state)
         self.assertIsNotNone(candidate.kwargs["stop_policy"])
         self.assertIsNotNone(candidate.kwargs["session_access_policy"])
+        self.assertIsNotNone(candidate.kwargs["session_prompt_filter"])
+        self.assertTrue(candidate.kwargs["evaluate_initial_stop"])
+        self.assertEqual(candidate.kwargs["stop_policy_infra_retries"], 1)
+        self.assertTrue(candidate.kwargs["abort_on_stop_policy_infra"])
+        self.assertIsNotNone(candidate.kwargs["iteration_acceptance"])
+        self.assertIsNotNone(candidate.kwargs["iteration_change_detector"])
+        self.assertIn("did not improve", rejection)
+        self.assertIsNotNone(candidate.kwargs["on_iteration"])
         self.assertIn("hidden-audited", candidate.kwargs["session_directive"])
 
     def test_successful_resume_revalidates_hashes_without_rerunning_campaign(self) -> None:
@@ -310,6 +335,100 @@ class TeacherCampaignTest(unittest.TestCase):
         self.assertEqual(FakeCandidate.instances[0].run_calls, 1)
         self.assertEqual(FakeCandidate.instances[1].setup_calls, 0)
         self.assertEqual(FakeCandidate.instances[1].run_calls, 0)
+
+    def test_teacher_provenance_must_match_selected_operator(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-operator-mismatch-") as temp_dir:
+            root = Path(temp_dir)
+            request = self._request(root)
+            provenance_path = request.teacher_solution / "provenance.json"
+            provenance = json.loads(provenance_path.read_text())
+            provenance["operator"] = {
+                "canonical_id": "different_operator",
+                "aliases": ["other"],
+            }
+            provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+            result = TeacherDistillCampaign(request).run()
+
+        self.assertEqual(result.status, CampaignTerminalStatus.INFRA_ERROR)
+        self.assertIn("operator does not match", result.reason)
+
+    def test_setup_failure_returns_and_persists_infra_terminal_result(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-campaign-setup-failure-") as temp_dir:
+            root = Path(temp_dir)
+            request = self._request(root)
+            patches = self._patch_dependencies(root)
+            with (
+                patches[0],
+                patches[1],
+                mock.patch(
+                    "teacher_distill.campaign.benchmark_teacher",
+                    side_effect=RuntimeError("gateway unavailable"),
+                ),
+                patches[3],
+                patches[4],
+            ):
+                result = TeacherDistillCampaign(request).run()
+            result_files = list(
+                request.private_root.glob("setup_failures/*/result.json")
+            )
+
+        self.assertEqual(result.status, CampaignTerminalStatus.INFRA_ERROR)
+        self.assertIn("gateway unavailable", result.reason)
+        self.assertEqual(len(result_files), 1)
+
+    def test_candidate_setup_failure_persists_campaign_infra_result(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-candidate-setup-failure-") as temp_dir:
+            root = Path(temp_dir)
+            request = self._request(root)
+            patches = self._patch_dependencies(root)
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                mock.patch(
+                    "teacher_distill.campaign.optimize.Campaign",
+                    side_effect=RuntimeError("verifier setup failed"),
+                ),
+                patches[4],
+            ):
+                result = TeacherDistillCampaign(request).run()
+            result_files = list(request.private_root.glob("campaign_*/result.json"))
+
+        self.assertEqual(result.status, CampaignTerminalStatus.INFRA_ERROR)
+        self.assertIn("verifier setup failed", result.reason)
+        self.assertEqual(len(result_files), 1)
+
+    def test_plateau_or_budget_terminal_result_does_not_restart_agents_on_resume(self) -> None:
+        for terminal_reason, expected in (
+            ("stall: 5 iterations with no commit", CampaignTerminalStatus.PLATEAU),
+            ("budget: max-iters", CampaignTerminalStatus.BUDGET_EXHAUSTED),
+        ):
+            with self.subTest(terminal_reason=terminal_reason):
+                with tempfile.TemporaryDirectory(prefix="teacher-terminal-resume-") as temp_dir:
+                    root = Path(temp_dir)
+                    request = self._request(root)
+                    patches = self._patch_dependencies(root)
+                    FakeCandidate.run_reason = terminal_reason
+                    first_index = len(FakeCandidate.instances)
+                    with (
+                        patches[0],
+                        patches[1],
+                        patches[2],
+                        patches[3],
+                        patches[4],
+                        mock.patch(
+                            "teacher_distill.campaign.TeacherEscalationManager.continue_after_stall",
+                            return_value=terminal_reason,
+                        ),
+                    ):
+                        first = TeacherDistillCampaign(request).run()
+                        second = TeacherDistillCampaign(request).run()
+
+                self.assertEqual(first.status, expected)
+                self.assertEqual(second.status, expected)
+                self.assertEqual(FakeCandidate.instances[first_index].run_calls, 1)
+                self.assertEqual(FakeCandidate.instances[first_index + 1].run_calls, 0)
 
     def test_incomplete_private_preparation_is_rebuilt_without_touching_candidate(self) -> None:
         with tempfile.TemporaryDirectory(prefix="teacher-campaign-rebuild-") as temp_dir:
@@ -357,6 +476,24 @@ class TeacherCampaignTest(unittest.TestCase):
         self.assertTrue(prepared.private_dir.is_absolute())
         benchmark.assert_called_once()
 
+    def test_resume_rejects_materialized_teacher_workspace_tampering(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-workspace-tamper-") as temp_dir:
+            root = Path(temp_dir)
+            request = self._request(root)
+            patches = self._patch_dependencies(root)
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                TeacherDistillCampaign(request).run()
+                teacher_workspace = next(
+                    request.private_root.glob("campaign_*/teacher_workspace")
+                )
+                (teacher_workspace / "kernel.py").write_text(
+                    "# tampered teacher\n", encoding="utf-8"
+                )
+                result = TeacherDistillCampaign(request).run()
+
+        self.assertEqual(result.status, CampaignTerminalStatus.INFRA_ERROR)
+        self.assertIn("materialized Teacher workspace", result.reason)
+
     def test_changed_threshold_is_rejected_as_resume_mismatch(self) -> None:
         with tempfile.TemporaryDirectory(prefix="teacher-campaign-mismatch-") as temp_dir:
             root = Path(temp_dir)
@@ -367,8 +504,32 @@ class TeacherCampaignTest(unittest.TestCase):
                 changed = TeacherDistillRequest(
                     **{**request.__dict__, "shape_ratio": 1.20}
                 )
-                with self.assertRaisesRegex(RuntimeError, "RESUME_CONFIG_MISMATCH"):
-                    TeacherDistillCampaign(changed).run()
+                result = TeacherDistillCampaign(changed).run()
+                self.assertEqual(result.status, CampaignTerminalStatus.INFRA_ERROR)
+                self.assertIn("RESUME_CONFIG_MISMATCH", result.reason)
+
+    def test_resume_rejects_hardware_or_escalation_drift(self) -> None:
+        for override in (
+            {"sandbox_hardware": "other-hardware"},
+            {"partial_restarts": 0},
+            {"stall_before_episode": 4},
+            {"agent_cli": "claude"},
+        ):
+            with self.subTest(override=override):
+                with tempfile.TemporaryDirectory(prefix="teacher-campaign-lock-drift-") as temp_dir:
+                    root = Path(temp_dir)
+                    request = self._request(root)
+                    patches = self._patch_dependencies(root)
+                    with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                        TeacherDistillCampaign(request).run()
+                        changed = TeacherDistillRequest(
+                            **{**request.__dict__, **override}
+                        )
+                        result = TeacherDistillCampaign(changed).run()
+                        self.assertEqual(
+                            result.status, CampaignTerminalStatus.INFRA_ERROR
+                        )
+                        self.assertIn("RESUME_CONFIG_MISMATCH", result.reason)
 
     def test_stall_enters_one_escalation_manager_before_terminal_mapping(self) -> None:
         with tempfile.TemporaryDirectory(prefix="teacher-campaign-escalation-") as temp_dir:

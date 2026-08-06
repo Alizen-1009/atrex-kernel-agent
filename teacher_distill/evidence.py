@@ -29,6 +29,21 @@ def _version_number(path: Path) -> int:
     return int(match.group(1)) if match else 1 << 60
 
 
+def _abba_classification(path: Path) -> tuple[str, bool]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "invalid-run", False
+    status = value.get("verification_status") if isinstance(value, dict) else None
+    if status == "PASS":
+        return "verified-pass", True
+    if status == "FAIL":
+        return "verified-fail", False
+    if status == "INFRA_ERROR":
+        return "infrastructure-error", False
+    return "unscored-run", False
+
+
 def _classification(memory: dict) -> tuple[str, bool]:
     if memory.get("masked", False):
         return "masked", False
@@ -180,6 +195,7 @@ def build_evidence_bundle(workspace: Path | str, private_dir: Path | str) -> Evi
 
     abba_files = sorted(private.glob("**/.atrex_teacher_verify/*/result.json"))
     for index, path in enumerate(abba_files, 1):
+        classification, citable = _abba_classification(path)
         evidence.append(
             _evidence_entry(
                 evidence_id="E-ABBA-%03d" % index,
@@ -187,8 +203,8 @@ def build_evidence_bundle(workspace: Path | str, private_dir: Path | str) -> Evi
                 path=path,
                 scope="private",
                 relative=path.relative_to(private).as_posix(),
-                classification="verified-run",
-                citable=True,
+                classification=classification,
+                citable=citable,
             )
         )
 
@@ -229,6 +245,41 @@ def build_evidence_bundle(workspace: Path | str, private_dir: Path | str) -> Evi
                 path=path,
                 scope="candidate",
                 relative=path.relative_to(candidate).as_posix(),
+                classification="exploratory",
+                citable=False,
+            )
+        )
+
+    checkpoint_files = sorted(
+        (path, root)
+        for root, patterns in (
+            (
+                candidate,
+                (
+                    ".atrex_long_horizon/episodes/*/archive/**/*",
+                    ".atrex_long_horizon/episodes/*/interrupted_archive/**/*",
+                ),
+            ),
+            (
+                private,
+                (
+                    "long_horizon/episodes/*/archive/**/*",
+                    "long_horizon/episodes/*/interrupted_archive/**/*",
+                ),
+            ),
+        )
+        for pattern in patterns
+        for path in root.glob(pattern)
+        if path.is_file()
+    )
+    for index, (path, checkpoint_root) in enumerate(checkpoint_files, 1):
+        evidence.append(
+            _evidence_entry(
+                evidence_id="E-EPISODE-CHECKPOINT-%03d" % index,
+                kind="episode-checkpoint",
+                path=path,
+                scope="private",
+                relative=path.relative_to(checkpoint_root).as_posix(),
                 classification="exploratory",
                 citable=False,
             )

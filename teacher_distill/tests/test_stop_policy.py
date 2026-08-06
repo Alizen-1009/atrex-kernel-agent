@@ -114,6 +114,23 @@ class TeacherStopPolicyTest(unittest.TestCase):
         self.assertFalse(persisted["provisional_target_met"])
         self.assertEqual(persisted["abba_status"], "NOT_RUN")
 
+    def test_rejected_measured_iteration_records_progress_without_abba(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-stop-rejected-") as temp_dir:
+            root = Path(temp_dir)
+            verifier = FakeVerifier(self._result(AbbaStatus.PASS))
+            policy = TeacherStopPolicy(self._target(), self._teacher(root), verifier)
+            campaign = self._campaign(root)
+            memory = self._memory(103.0, 84.0, 128.0)
+
+            policy.record_measured_iteration(campaign, 2, memory, accepted=False)
+            persisted = json.loads(
+                (campaign.workspace / "memory/v2.json").read_text(encoding="utf-8")
+            )["teacher_progress"]
+
+        self.assertEqual(verifier.calls, [])
+        self.assertTrue(persisted["provisional_target_met"])
+        self.assertEqual(persisted["abba_status"], "NOT_RUN")
+
     def test_geomean_pass_does_not_hide_a_shape_regression(self) -> None:
         with tempfile.TemporaryDirectory(prefix="teacher-stop-shape-") as temp_dir:
             root = Path(temp_dir)
@@ -173,6 +190,49 @@ class TeacherStopPolicyTest(unittest.TestCase):
                 self.assertEqual(decision.status, expected_decision)
                 self.assertEqual(persisted["abba_status"], status.value)
 
+    def test_forged_public_abba_pass_does_not_bypass_private_verification(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-stop-forged-pass-") as temp_dir:
+            root = Path(temp_dir)
+            verifier = FakeVerifier(self._result(AbbaStatus.PASS))
+            policy = TeacherStopPolicy(self._target(), self._teacher(root), verifier)
+            campaign = self._campaign(root)
+            memory = self._memory(103.0, 84.0, 128.0)
+            memory["teacher_progress"] = {
+                "target_id": self._target().teacher_id,
+                "candidate_to_teacher_geomean_ratio": 1.03,
+                "worst_shape_ratio": 1.05,
+                "worst_shape_key": "a",
+                "geomean_gate_met": True,
+                "shape_gate_met": True,
+                "provisional_target_met": True,
+                "abba_status": "PASS",
+                "final_candidate_to_teacher_ratio": 1.0,
+            }
+            with mock.patch.object(optimize, "git_head", return_value="abc123"):
+                decision = policy.evaluate_accepted_iteration(campaign, 2, memory)
+
+        self.assertEqual(decision.status, StopDecisionStatus.SUCCESS)
+        self.assertEqual(len(verifier.calls), 1)
+
+    def test_abba_fail_is_not_repeated_for_unchanged_candidate(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-stop-no-repeat-") as temp_dir:
+            root = Path(temp_dir)
+            verifier = FakeVerifier(self._result(AbbaStatus.FAIL))
+            policy = TeacherStopPolicy(self._target(), self._teacher(root), verifier)
+            campaign = self._campaign(root)
+            memory = self._memory(103.0, 84.0, 128.0)
+            with mock.patch.object(optimize, "git_head", return_value="abc123"):
+                policy.evaluate_accepted_iteration(campaign, 2, memory)
+                persisted_memory = json.loads(
+                    (campaign.workspace / "memory/v2.json").read_text(encoding="utf-8")
+                )
+                second = policy.evaluate_accepted_iteration(
+                    campaign, 2, persisted_memory
+                )
+
+        self.assertEqual(second.status, StopDecisionStatus.CONTINUE)
+        self.assertEqual(len(verifier.calls), 1)
+
     def test_progress_is_committed_as_metadata_so_a_later_reset_cannot_erase_it(self) -> None:
         with tempfile.TemporaryDirectory(prefix="teacher-stop-commit-") as temp_dir:
             root = Path(temp_dir)
@@ -194,6 +254,12 @@ class TeacherStopPolicyTest(unittest.TestCase):
                 ["git", "commit", "-q", "-m", "candidate"], cwd=campaign.workspace, check=True
             )
 
+            (campaign.workspace / "unrelated.txt").write_text(
+                "must remain uncommitted\n", encoding="utf-8"
+            )
+            subprocess.run(
+                ["git", "add", "unrelated.txt"], cwd=campaign.workspace, check=True
+            )
             policy.evaluate_accepted_iteration(
                 campaign, 2, self._memory(118.0, 95.0, 140.0)
             )
@@ -204,6 +270,13 @@ class TeacherStopPolicyTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
             ).stdout
+            committed_paths = subprocess.run(
+                ["git", "show", "--name-only", "--format=", "HEAD"],
+                cwd=campaign.workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
             message = subprocess.run(
                 ["git", "log", "-1", "--pretty=%s"],
                 cwd=campaign.workspace,
@@ -212,7 +285,8 @@ class TeacherStopPolicyTest(unittest.TestCase):
                 text=True,
             ).stdout.strip()
 
-        self.assertEqual(status, "")
+        self.assertIn("A  unrelated.txt", status)
+        self.assertEqual(committed_paths, ["memory/v2.json"])
         self.assertEqual(message, "v2: record Teacher progress")
 
     def test_missing_invalid_or_mismatched_measurements_fail_closed(self) -> None:

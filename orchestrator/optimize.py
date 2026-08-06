@@ -1857,10 +1857,22 @@ class Campaign:
     framework_baseline: str = "auto"        # auto = production only; always | never override it
     framework_baseline_timeout: int = FRAMEWORK_BASELINE_TIMEOUT_S
     stop_policy: Optional[StopPolicy] = field(default=None, repr=False, compare=False)
+    evaluate_initial_stop: bool = False
+    stop_policy_infra_retries: int = 0
+    abort_on_stop_policy_infra: bool = False
+    iteration_acceptance: Optional[
+        Callable[["Campaign", int, dict, Optional[float]], Optional[str]]
+    ] = field(default=None, repr=False, compare=False)
+    iteration_change_detector: Optional[
+        Callable[["Campaign", str, str], bool]
+    ] = field(default=None, repr=False, compare=False)
     runtime_linker: Optional[Callable[["Campaign"], None]] = field(
         default=None, repr=False, compare=False
     )
     session_directive: str = field(default="", repr=False, compare=False)
+    session_prompt_filter: Optional[Callable[[str], str]] = field(
+        default=None, repr=False, compare=False
+    )
     session_access_policy: Optional[_agent_runtime.ProcessAccessPolicy] = field(
         default=None, repr=False, compare=False
     )
@@ -1906,8 +1918,14 @@ class Campaign:
         reasoning_effort: str = "max",
         extra_environment: Optional[dict[str, str]] = None,
     ) -> SessionResult:
+        filtered = self.session_prompt_filter is not None
+        if self.session_prompt_filter is not None:
+            prompt = self.session_prompt_filter(prompt)
         if self.session_directive:
-            prompt = self.session_directive.rstrip() + "\n\n" + prompt
+            directive = self.session_directive.rstrip()
+            prompt = directive + "\n\n" + prompt
+            if filtered:
+                prompt = prompt.rstrip() + "\n\n" + directive
         return run_session(
             self.workspace,
             prompt,
@@ -2599,6 +2617,49 @@ class Campaign:
     def budget_exhausted(self) -> bool:
         return self.token_budget > 0 and self.tokens_spent >= self.token_budget
 
+    def _reject_iteration_candidate(self, n: int, pre_head: str, reason: str) -> None:
+        memory_path = self.workspace / "memory" / f"v{n}.json"
+        try:
+            memory = json.loads(memory_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            memory = {"version": f"v{n}"}
+        subprocess.run(
+            ["git", "reset", "--hard", pre_head],
+            cwd=str(self.workspace),
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        memory_path.parent.mkdir(parents=True, exist_ok=True)
+        memory["version"] = f"v{n}"
+        memory["masked"] = False
+        memory["git_commit_hash"] = None
+        memory["quality_gate"] = {
+            "result": "FAIL",
+            "failure_reason": "iteration acceptance rejection: " + reason,
+        }
+        pitfalls = memory.setdefault("pitfalls_and_fixes", [])
+        pitfalls.append(
+            {
+                "error_type": "iteration_acceptance",
+                "error_message": reason,
+                "lesson": "a committed candidate must remain correct and improve the incumbent",
+            }
+        )
+        memory_path.write_text(
+            json.dumps(memory, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    def _evaluate_stop_with_retries(self, version: int, memory: dict) -> StopDecision:
+        decision = StopDecision.continue_()
+        for _attempt in range(max(0, int(self.stop_policy_infra_retries)) + 1):
+            decision = self._accepted_stop_decision(version, memory)
+            if decision.status != StopDecisionStatus.INFRA_ERROR:
+                break
+            self._report_stop_policy_infra_error(decision)
+        return decision
+
     def _notify_improvement(
         self, n: int, mem: Optional[dict], previous_latency: Optional[float]
     ) -> None:
@@ -2733,8 +2794,27 @@ class Campaign:
             print(f"[orchestrator] stall counter restored: {stall} rounds without progress", flush=True)
         infra_fails = 0  # consecutive sessions that crashed with 0 tokens (auth/infra issue)
         n = latest_version(self.workspace)  # 0 after baseline
+        pending_stop_version: Optional[int] = n if self.evaluate_initial_stop else None
         mask_half_memory(self.workspace, n)  # also covers resuming an unmasked v100/v200/...
         while True:
+            if pending_stop_version is not None:
+                pending_memory = read_memory(self.workspace, pending_stop_version)
+                if pending_memory:
+                    pending_decision = self._evaluate_stop_with_retries(
+                        pending_stop_version,
+                        pending_memory,
+                    )
+                    if pending_decision.status == StopDecisionStatus.SUCCESS:
+                        return self._finish(pending_decision.reason)
+                    if pending_decision.status != StopDecisionStatus.INFRA_ERROR:
+                        pending_stop_version = None
+                    elif self.abort_on_stop_policy_infra:
+                        return self._finish(
+                            "infra: stop-policy verification failed after retries: "
+                            + pending_decision.reason
+                        )
+                else:
+                    pending_stop_version = None
             conversion_pending = should_convert_to_gluon(
                 self.framework,
                 stall,
@@ -2810,6 +2890,19 @@ class Campaign:
                     )
                     telemetry = None
 
+            if (
+                self.session_access_policy is not None
+                and res.exit_status == 126
+                and (
+                    "teacher knowledge access policy violation" in res.stderr_tail.casefold()
+                    or "hidden-teacher network access" in res.stderr_tail.casefold()
+                    or "dependency policy violation" in res.stderr_tail.casefold()
+                )
+            ):
+                return self._finish(
+                    "TEACHER_LEAKAGE_VIOLATION: forbidden access was audited"
+                )
+
             # Robust infra-failure handling: distinguish crash vs timeout, retry up to 15
             # consecutive failures with progressive backoff before giving up. A 2-fail
             # cutoff was too aggressive — transient API rate-limits and short network blips
@@ -2850,7 +2943,12 @@ class Campaign:
                 infra_fails = 0
 
             mem = read_memory(self.workspace, n)
-            won = kernel_won(self.workspace, pre_head)  # git-native "committed a kernel.py win" — reused below
+            post_head = git_head(self.workspace)
+            won = (
+                self.iteration_change_detector(self, pre_head, post_head)
+                if self.iteration_change_detector is not None
+                else kernel_won(self.workspace, pre_head)
+            )
             if won and self.optimization_mode == "production":
                 violations = production_kernel_violations(
                     self.workspace,
@@ -2862,6 +2960,18 @@ class Campaign:
                     print(
                         "[orchestrator] production policy rejected v"
                         f"{n}: {'; '.join(violations)}; reverted to {pre_head[:8]}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    mem = read_memory(self.workspace, n)
+                    won = False
+            if won and self.iteration_acceptance is not None:
+                rejection = self.iteration_acceptance(self, n, mem or {}, previous_latency)
+                if rejection:
+                    self._reject_iteration_candidate(n, pre_head, rejection)
+                    print(
+                        f"[orchestrator] iteration acceptance rejected v{n}: {rejection}; "
+                        f"reverted to {pre_head[:8]}",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -2954,6 +3064,9 @@ class Campaign:
                     mask_half_memory(self.workspace, n)
                     return self._finish(decision.reason)
                 self._report_stop_policy_infra_error(decision)
+                pending_stop_version = (
+                    n if decision.status == StopDecisionStatus.INFRA_ERROR else None
+                )
                 stall = 0
                 write_stall(self.workspace, stall)
             else:
