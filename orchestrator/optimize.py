@@ -5897,6 +5897,13 @@ def main(argv: Optional[list[str]] = None) -> int:
              "third-party kernel/operator dependencies and mechanically enforces each campaign's framework.",
     )
     ap.add_argument(
+        "--campaign-mode",
+        choices=("standard", "teacher-distill"),
+        default="standard",
+        help="standard keeps the existing optimizer; teacher-distill runs the opt-in offline "
+             "hidden-Teacher 1-to-10 workflow.",
+    )
+    ap.add_argument(
         "--framework", default="",
         help="Target DSL, e.g. Triton / CuteDSL / Cuda / FlyDSL. When omitted, launch all "
              "frameworks supported by the detected hardware in parallel: NVIDIA uses "
@@ -5910,6 +5917,40 @@ def main(argv: Optional[list[str]] = None) -> int:
                          "own workspace under one shared --max-iters budget, then recombine. Default off "
                          "(single-op SOL path uses workload bucketing instead).")
     ap.add_argument("--notes", default="none", help="Extra constraints / known bottlenecks.")
+    ap.add_argument(
+        "--teacher-solution",
+        default="",
+        help="Self-contained same-framework Teacher solution bundle (teacher-distill only).",
+    )
+    ap.add_argument(
+        "--teacher-geomean-ratio",
+        type=float,
+        default=1.05,
+        help="Candidate/Teacher geomean acceptance ratio (teacher-distill; default 1.05).",
+    )
+    ap.add_argument(
+        "--teacher-shape-ratio",
+        type=float,
+        default=1.10,
+        help="Maximum per-shape Candidate/Teacher ratio (teacher-distill; default 1.10).",
+    )
+    ap.add_argument(
+        "--teacher-stall-before-episode",
+        type=int,
+        default=3,
+        help="Consecutive stalls before one isolated long-horizon episode (default 3).",
+    )
+    ap.add_argument(
+        "--teacher-partial-restarts",
+        type=int,
+        default=1,
+        help="Maximum partial-memory restarts after failed Teacher exploration (default 1).",
+    )
+    ap.add_argument(
+        "--teacher-private-root",
+        default="",
+        help="Private Teacher supervisor state root (default: <workspace>/.atrex_teacher_campaigns).",
+    )
     ap.add_argument("--max-iters", type=int, default=20, help="Hard cap on optimization iterations.")
     ap.add_argument(
         "--max-workload-buckets",
@@ -5963,6 +6004,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--workspace-suffix", default="", help=argparse.SUPPRESS)
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = ap.parse_args(raw_argv)
+    teacher_cli = None
+    teacher_options_used = args.campaign_mode == "teacher-distill" or any(
+        value.startswith("--teacher-") for value in raw_argv
+    )
+    if teacher_options_used:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        from teacher_distill import cli as teacher_cli_module
+        teacher_cli = teacher_cli_module
+        teacher_cli.preflight_teacher_args(ap, args, raw_argv)
     if args.workspace_suffix and args.workspace_suffix != _workspace_slug(args.workspace_suffix):
         ap.error("--workspace-suffix must be a normalized lowercase alphanumeric/underscore suffix")
     if not 1 <= args.sandbox_timeout <= MAX_SANDBOX_TIMEOUT:
@@ -6021,6 +6072,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     op = _resolve_op(args.op_dir)
     ensure_submodules()
+    if args.campaign_mode == "teacher-distill":
+        if teacher_cli is None:
+            raise RuntimeError("teacher-distill CLI policy was not initialized")
+        request = teacher_cli.build_request(args, op, arch, sandbox_hardware)
+        return teacher_cli.run_teacher_distill(request)
     frameworks = (args.framework,) if args.framework else supported_frameworks(args.platform, arch)
     print(f"[orchestrator] op={op['name']} agent_cli={args.agent_cli} "
           f"optimization_mode={args.optimization_mode} platform={args.platform} "

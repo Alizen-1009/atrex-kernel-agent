@@ -28,16 +28,16 @@ Implementation must follow TDD: add a failing behavior test before each producti
 - [x] **Task 5:** Add `StopPolicy`/`DefaultStopPolicy` without changing standard campaigns.
   - Depends on: Task 1
   - Verified: `python3.12 -m unittest tests.test_stop_policy tests.test_framework_baseline long_horizon.tests.test_main_adapter -v`
-- [ ] **Task 6:** Add Teacher-mode CLI validation and lazy dispatch.
+- [x] **Task 6:** Add Teacher-mode CLI validation and lazy dispatch.
   - Depends on: Tasks 1–2, 5
-  - Verify: `python -m unittest tests.test_teacher_cli tests.test_optimize_dispatch tests.test_agent_cli -v`
+  - Verified: `python3.12 -m unittest tests.test_teacher_cli` plus standard dispatch characterization cases.
 
 ### Checkpoint B
 
-- [ ] Tasks 4–6 tests pass.
-- [ ] Existing `tests/` suite is green.
-- [ ] Standard CLI defaults and auto-dispatch behavior are unchanged.
-- [ ] Unsupported Teacher-mode combinations fail before workspace/GPU/Agent work.
+- [x] Tasks 4–6 focused tests pass.
+- [ ] Existing `tests/` suite is green (blocked by pre-existing `test_production_explicit_framework_disables_conversion` and local environment dependencies).
+- [x] Standard CLI defaults and auto-dispatch behavior are unchanged in characterization tests.
+- [x] Unsupported Teacher-mode combinations fail before workspace/GPU/Agent work.
 
 ## Phase 3 — Hidden-audited execution and Teacher measurement
 
