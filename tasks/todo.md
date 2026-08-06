@@ -9,16 +9,16 @@ Implementation must follow TDD: add a failing behavior test before each producti
 - [x] **Task 2:** Validate and fingerprint self-contained Teacher bundles.
   - Depends on: Task 1
   - Verified: `python3.12 -m unittest teacher_distill.tests.test_bundle -v`
-- [ ] **Task 3:** Build a physical, content-addressed sanitized gpu-wiki view.
+- [x] **Task 3:** Build a physical, content-addressed sanitized gpu-wiki view.
   - Depends on: Tasks 1–2
-  - Verify: `python -m unittest teacher_distill.tests.test_knowledge_view -v`
+  - Verified: `python3.12 -m unittest teacher_distill.tests.test_knowledge_view -v`
 
 ### Checkpoint A
 
-- [ ] Tasks 1–3 tests pass.
-- [ ] Valid/invalid bundle fixtures behave fail-closed.
-- [ ] Sanitized view is deterministic, queryable, self-contained, and contains no original-wiki symlinks.
-- [ ] Review the generated inclusion/exclusion report.
+- [x] Tasks 1–3 tests pass.
+- [x] Valid/invalid bundle fixtures behave fail-closed.
+- [x] Sanitized view is deterministic, queryable, self-contained, and contains no original-wiki symlinks.
+- [x] Reviewed the generated inclusion/exclusion report on the repository gpu-wiki.
 
 ## Phase 2 — Backward-compatible orchestration seams
 
