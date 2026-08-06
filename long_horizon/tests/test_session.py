@@ -278,6 +278,21 @@ class SessionRecoveryTests(unittest.TestCase):
                 [
                     json.dumps(
                         {
+                            "type": "message_update",
+                            "message": {
+                                "role": "assistant",
+                                "usage": {
+                                    "input": 2,
+                                    "output": 3,
+                                    "cacheRead": 5,
+                                    "cacheWrite": 0,
+                                    "totalTokens": 10,
+                                },
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
                             "type": "message_end",
                             "message": {
                                 "role": "assistant",

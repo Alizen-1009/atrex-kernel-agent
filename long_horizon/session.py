@@ -144,9 +144,13 @@ class LongSessionRunner:
             )
             stdout_parts.append(stdout)
             stderr_parts.append(stderr)
-            total_tokens += main_adapter.tokens_from_stream(stdout)
             events, terminal_usage, capabilities, observation_errors = (
                 main_adapter.normalize_stream(self.agent_cli, stdout)
+            )
+            total_tokens += (
+                terminal_usage.total_tokens
+                if terminal_usage.total_tokens is not None
+                else main_adapter.tokens_from_stream(stdout)
             )
             invocations.append(
                 InvocationObservation(
