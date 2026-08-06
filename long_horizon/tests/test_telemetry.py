@@ -179,6 +179,50 @@ class EpisodeTelemetryTests(unittest.TestCase):
         self.assertEqual(planning["interval_count"], 0)
         self.assertEqual(summary["phase_intervals"]["planning"], [])
 
+    def test_qualified_resume_attributes_phase_across_invocation_boundary(self) -> None:
+        first = InvocationObservation(
+            terminal_usage=usage(10),
+            events=(
+                NormalizedAgentEvent(0, "usage_delta", usage=usage(10)),
+                marker(1, "research", "start"),
+                NormalizedAgentEvent(2, "terminal_usage", usage=usage(10)),
+            ),
+            capabilities=CAPABILITIES,
+            resume_usage_qualified=True,
+        )
+        second = InvocationObservation(
+            terminal_usage=usage(7),
+            events=(
+                NormalizedAgentEvent(0, "usage_delta", usage=usage(7)),
+                marker(1, "research", "end"),
+                NormalizedAgentEvent(2, "terminal_usage", usage=usage(7)),
+            ),
+            capabilities=CAPABILITIES,
+            resume_usage_qualified=True,
+        )
+
+        summary = summarize_episode(
+            episode=1,
+            version=1,
+            status="pivot",
+            accepted=False,
+            control_tokens=17,
+            resume_count=1,
+            invocations=(first, second),
+        )
+
+        tokens = summary["phase_tokens"]
+        self.assertEqual(tokens["phases"]["research"]["usage"]["total_tokens"], 17)
+        self.assertEqual(tokens["accounted_coverage"], 1.0)
+        self.assertEqual(tokens["unattributed"]["total_tokens"], 0)
+        self.assertEqual(tokens["reconciliation_status"], "reconciled")
+        self.assertNotIn(
+            "same_session_resume_usage_semantics_unqualified",
+            summary["reason_codes"],
+        )
+        self.assertNotIn("unclosed_phase", summary["reason_codes"])
+        self.assertNotIn("orphan_phase_end", summary["reason_codes"])
+
     def test_missing_structured_observation_preserves_control_total_as_unattributed(self) -> None:
         summary = summarize_episode(
             episode=1,
