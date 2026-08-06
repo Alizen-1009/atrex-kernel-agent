@@ -19,6 +19,8 @@ from .benchmark import (
 )
 from .bundle import ValidatedTeacherBundle, validate_teacher_bundle
 from .cli import TeacherDistillRequest
+from .distillation import generate_distillation
+from .escalation import LongHorizonEpisodeRunner, TeacherEscalationManager
 from .knowledge_view import KnowledgeView, build_knowledge_view
 from .models import (
     CampaignLock,
@@ -58,6 +60,15 @@ class TeacherDistillCampaign:
         if not isinstance(request, TeacherDistillRequest):
             raise TypeError("request must be a TeacherDistillRequest")
         self.request = request
+        candidate = self.candidate_workspace.resolve()
+        private = self.request.private_root.resolve()
+        if candidate == private or candidate in private.parents or private in candidate.parents:
+            raise ValueError(
+                "Teacher private root and Candidate workspace must be disjoint siblings"
+            )
+        teacher = self.request.teacher_solution.resolve()
+        if teacher == candidate or candidate in teacher.parents or teacher in candidate.parents:
+            raise ValueError("Teacher solution must be outside the Candidate workspace")
 
     @property
     def candidate_workspace(self) -> Path:
@@ -186,10 +197,10 @@ class TeacherDistillCampaign:
         private_dir: Path,
     ) -> PreparedTeacherCampaign:
         if private_dir.exists() and any(private_dir.iterdir()):
-            raise RuntimeError(
-                "private Teacher state already exists without a resumable public lock: %s"
-                % private_dir
-            )
+            # No PRIVATE_STATE_FILE means preparation never became resumable.
+            # Discard only this incomplete supervisor-owned staging state; Candidate
+            # Git/workspace state is outside this directory and is never touched.
+            shutil.rmtree(private_dir)
         private_dir.mkdir(parents=True, exist_ok=True)
         view = self._build_view(bundle)
         materialized = self._materialize(bundle, private_dir / "teacher_workspace")
@@ -241,29 +252,25 @@ class TeacherDistillCampaign:
         if errors:
             raise RuntimeError("RESUME_CONFIG_MISMATCH: " + ", ".join(errors))
 
-    def _prepare_resume(
+    def _prepare_from_private_state(
         self,
         bundle: ValidatedTeacherBundle,
         operator_hash: str,
-        public_lock: CampaignLock,
+        campaign_id: str,
     ) -> PreparedTeacherCampaign:
         expected_id = campaign_id_for(self._campaign_identity(bundle, operator_hash))
-        if public_lock.campaign_id != expected_id:
+        if campaign_id != expected_id:
             raise RuntimeError("RESUME_CONFIG_MISMATCH: campaign identity")
-        private_dir = self.request.private_root / public_lock.campaign_id
+        private_dir = self.request.private_root / campaign_id
         private_state = read_json_object(private_dir / PRIVATE_STATE_FILE, "private campaign state")
         view = self._build_view(bundle)
-        target = TeacherTarget.from_mapping(
-            read_json_object(self.candidate_workspace / PUBLIC_TARGET_FILE, "public Teacher target")
-        )
-        stored_lock = CampaignLock.from_mapping(
-            read_json_object(self.candidate_workspace / PUBLIC_LOCK_FILE, "public campaign lock")
-        )
+        target = TeacherTarget.from_mapping(private_state.get("target") or {})
+        stored_lock = CampaignLock.from_mapping(private_state.get("lock") or {})
         materialized = self._materialized_from_mapping(private_state["materialized"])
         if not materialized.workspace.is_dir():
             raise RuntimeError("private Teacher workspace is missing")
         prepared = PreparedTeacherCampaign(
-            public_lock.campaign_id,
+            campaign_id,
             private_dir,
             bundle,
             view,
@@ -279,6 +286,29 @@ class TeacherDistillCampaign:
         for field in ("workload_hash", "evaluator_hash", "measurement_config_hash"):
             if getattr(current, field) != getattr(stored_lock, field):
                 raise RuntimeError("RESUME_CONFIG_MISMATCH: %s" % field)
+        return prepared
+
+    def _prepare_resume(
+        self,
+        bundle: ValidatedTeacherBundle,
+        operator_hash: str,
+        public_lock: CampaignLock,
+    ) -> PreparedTeacherCampaign:
+        prepared = self._prepare_from_private_state(
+            bundle,
+            operator_hash,
+            public_lock.campaign_id,
+        )
+        public_target = TeacherTarget.from_mapping(
+            read_json_object(self.candidate_workspace / PUBLIC_TARGET_FILE, "public Teacher target")
+        )
+        stored_public_lock = CampaignLock.from_mapping(
+            read_json_object(self.candidate_workspace / PUBLIC_LOCK_FILE, "public campaign lock")
+        )
+        if canonical_json(public_target.to_mapping()) != canonical_json(prepared.target.to_mapping()):
+            raise RuntimeError("RESUME_CONFIG_MISMATCH: public Teacher target")
+        if canonical_json(stored_public_lock.to_mapping()) != canonical_json(prepared.lock.to_mapping()):
+            raise RuntimeError("RESUME_CONFIG_MISMATCH: public campaign lock")
         return prepared
 
     def _load_or_prepare(self) -> PreparedTeacherCampaign:
@@ -297,6 +327,8 @@ class TeacherDistillCampaign:
             )
             return self._prepare_resume(bundle, operator_hash, public_lock)
         private_dir = self.request.private_root / campaign_id
+        if (private_dir / PRIVATE_STATE_FILE).is_file():
+            return self._prepare_from_private_state(bundle, operator_hash, campaign_id)
         return self._prepare_fresh(bundle, operator_hash, campaign_id, private_dir)
 
     def _candidate_campaign(
@@ -342,7 +374,7 @@ class TeacherDistillCampaign:
             iter_timeout=self.request.iter_timeout,
             setup_timeout=self.request.setup_timeout,
             salvage_timeout=self.request.salvage_timeout,
-            max_stall=self.request.max_stall,
+            max_stall=self.request.stall_before_episode,
             convert_after=0,
             sandbox_hardware=self.request.sandbox_hardware,
             sandbox_profile=self.request.sandbox_profile,
@@ -529,13 +561,68 @@ class TeacherDistillCampaign:
             ratio = progress.get("candidate_to_teacher_geomean_ratio")
         return "v%d" % latest, float(ratio) if isinstance(ratio, (int, float)) else None
 
+    def _distill_result(
+        self,
+        prepared: PreparedTeacherCampaign,
+        candidate: optimize.Campaign,
+        result: TeacherCampaignResult,
+    ) -> TeacherCampaignResult:
+        try:
+            generate_distillation(
+                candidate.workspace,
+                prepared.private_dir,
+                result,
+                agent_cli=self.request.agent_cli,
+            )
+            return result
+        except Exception as exc:
+            failed = TeacherCampaignResult(
+                schema_version=1,
+                campaign_id=prepared.campaign_id,
+                status=CampaignTerminalStatus.INFRA_ERROR,
+                reason="distillation failed: %s: %s" % (type(exc).__name__, exc),
+                final_version=result.final_version,
+                final_candidate_to_teacher_ratio=result.final_candidate_to_teacher_ratio,
+            )
+            write_json_atomic(prepared.private_dir / PRIVATE_RESULT_FILE, failed.to_mapping())
+            return failed
+
     def run(self) -> TeacherCampaignResult:
         prepared = self._load_or_prepare()
         candidate = self._candidate_campaign(prepared)
+        prior_result_path = prepared.private_dir / PRIVATE_RESULT_FILE
+        if prior_result_path.is_file():
+            prior = TeacherCampaignResult.from_mapping(
+                read_json_object(prior_result_path, "Teacher campaign result")
+            )
+            if prior.status == CampaignTerminalStatus.SUCCESS:
+                report = prepared.private_dir / "distillation/drafts/validation_report.json"
+                return prior if report.is_file() else self._distill_result(prepared, candidate, prior)
+            if prior.status == CampaignTerminalStatus.TEACHER_LEAKAGE_VIOLATION:
+                audit_only = prepared.private_dir / "distillation/drafts/AUDIT_ONLY.md"
+                return prior if audit_only.is_file() else self._distill_result(prepared, candidate, prior)
         reason = ""
         try:
             self._prepare_candidate(candidate, prepared)
             reason = candidate.run()
+            if reason.startswith("stall:"):
+                session_policy = TeacherSessionPolicy(
+                    knowledge_view=prepared.knowledge_view.root,
+                    teacher_solution=prepared.bundle.root,
+                    private_root=prepared.private_dir,
+                    source_wiki=optimize.REPO_ROOT / "gpu-wiki",
+                    reference_projects=optimize.REPO_ROOT / "reference-projects",
+                )
+                escalation = TeacherEscalationManager(
+                    private_dir=prepared.private_dir,
+                    episode_runner=LongHorizonEpisodeRunner(
+                        session_policy=session_policy,
+                        private_dir=prepared.private_dir,
+                    ),
+                    partial_restart_limit=self.request.partial_restarts,
+                    final_max_stall=self.request.max_stall,
+                )
+                reason = escalation.continue_after_stall(candidate, reason)
         except Exception as exc:
             reason = "%s: %s" % (type(exc).__name__, exc)
         audit_log = prepared.private_dir / "audit" / "access-violations.jsonl"
@@ -552,7 +639,7 @@ class TeacherDistillCampaign:
             final_candidate_to_teacher_ratio=final_ratio,
         )
         write_json_atomic(prepared.private_dir / PRIVATE_RESULT_FILE, result.to_mapping())
-        return result
+        return self._distill_result(prepared, candidate, result)
 
     def run_cli(self) -> int:
         result = self.run()

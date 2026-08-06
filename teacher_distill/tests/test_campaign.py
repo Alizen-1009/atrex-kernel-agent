@@ -263,6 +263,7 @@ class TeacherCampaignTest(unittest.TestCase):
             mock.patch("teacher_distill.campaign.materialize_teacher_workspace", side_effect=materialize),
             mock.patch("teacher_distill.campaign.benchmark_teacher", return_value=benchmark),
             mock.patch("teacher_distill.campaign.optimize.Campaign", side_effect=FakeCandidate),
+            mock.patch("teacher_distill.campaign.generate_distillation"),
         )
 
     def test_fresh_campaign_locks_public_target_builds_v1_and_returns_success(self) -> None:
@@ -270,7 +271,7 @@ class TeacherCampaignTest(unittest.TestCase):
             root = Path(temp_dir)
             request = self._request(root)
             patches = self._patch_dependencies(root)
-            with patches[0], patches[1], patches[2] as benchmark, patches[3]:
+            with patches[0], patches[1], patches[2] as benchmark, patches[3], patches[4]:
                 result = TeacherDistillCampaign(request).run()
 
             candidate = FakeCandidate.instances[-1]
@@ -292,27 +293,76 @@ class TeacherCampaignTest(unittest.TestCase):
         self.assertIsNotNone(candidate.kwargs["session_access_policy"])
         self.assertIn("hidden-audited", candidate.kwargs["session_directive"])
 
-    def test_resume_reuses_teacher_benchmark_and_revalidates_hashes(self) -> None:
+    def test_successful_resume_revalidates_hashes_without_rerunning_campaign(self) -> None:
         with tempfile.TemporaryDirectory(prefix="teacher-campaign-resume-") as temp_dir:
             root = Path(temp_dir)
             request = self._request(root)
             patches = self._patch_dependencies(root)
-            with patches[0], patches[1], patches[2] as benchmark, patches[3]:
+            with patches[0], patches[1], patches[2] as benchmark, patches[3], patches[4]:
                 first = TeacherDistillCampaign(request).run()
                 second = TeacherDistillCampaign(request).run()
 
         self.assertEqual(first.status, CampaignTerminalStatus.SUCCESS)
         self.assertEqual(second.status, CampaignTerminalStatus.SUCCESS)
         benchmark.assert_called_once()
+        self.assertEqual(len(FakeCandidate.instances), 2)
         self.assertEqual(FakeCandidate.instances[0].setup_calls, 1)
+        self.assertEqual(FakeCandidate.instances[0].run_calls, 1)
         self.assertEqual(FakeCandidate.instances[1].setup_calls, 0)
+        self.assertEqual(FakeCandidate.instances[1].run_calls, 0)
+
+    def test_incomplete_private_preparation_is_rebuilt_without_touching_candidate(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-campaign-rebuild-") as temp_dir:
+            root = Path(temp_dir)
+            request = self._request(root)
+            patches = self._patch_dependencies(root)
+            with (
+                patches[0],
+                patches[1],
+                mock.patch(
+                    "teacher_distill.campaign.benchmark_teacher",
+                    side_effect=[RuntimeError("gateway unavailable"), TeacherBenchmarkResult(
+                        geomean_latency_us=100.0,
+                        latency_us_by_shape={"shape-a": 80.0, "shape-b": 125.0},
+                        workload_hash="b" * 64,
+                        evaluator_hash="c" * 64,
+                        measurement_config_hash="d" * 64,
+                    )],
+                ),
+                patches[3],
+                patches[4],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "gateway unavailable"):
+                    TeacherDistillCampaign(request)._load_or_prepare()
+                prepared = TeacherDistillCampaign(request)._load_or_prepare()
+                private_state_exists = (prepared.private_dir / "private_config.json").is_file()
+                candidate_exists = (
+                    request.workspace_root / "kernel_opt_gdn_cutedsl_h20_production"
+                ).exists()
+
+        self.assertTrue(private_state_exists)
+        self.assertFalse(candidate_exists)
+
+    def test_private_preparation_can_resume_before_public_lock_exists(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-campaign-private-resume-") as temp_dir:
+            root = Path(temp_dir)
+            request = self._request(root)
+            patches = self._patch_dependencies(root)
+            with patches[0], patches[1], patches[2] as benchmark, patches[3], patches[4]:
+                prepared = TeacherDistillCampaign(request)._load_or_prepare()
+                self.assertFalse((request.workspace_root / "kernel_opt_gdn_cutedsl_h20_production/campaign_lock.json").exists())
+                result = TeacherDistillCampaign(request).run()
+
+        self.assertEqual(result.status, CampaignTerminalStatus.SUCCESS)
+        self.assertTrue(prepared.private_dir.is_absolute())
+        benchmark.assert_called_once()
 
     def test_changed_threshold_is_rejected_as_resume_mismatch(self) -> None:
         with tempfile.TemporaryDirectory(prefix="teacher-campaign-mismatch-") as temp_dir:
             root = Path(temp_dir)
             request = self._request(root)
             patches = self._patch_dependencies(root)
-            with patches[0], patches[1], patches[2], patches[3]:
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 TeacherDistillCampaign(request).run()
                 changed = TeacherDistillRequest(
                     **{**request.__dict__, "shape_ratio": 1.20}
@@ -320,13 +370,36 @@ class TeacherCampaignTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "RESUME_CONFIG_MISMATCH"):
                     TeacherDistillCampaign(changed).run()
 
+    def test_stall_enters_one_escalation_manager_before_terminal_mapping(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-campaign-escalation-") as temp_dir:
+            root = Path(temp_dir)
+            request = self._request(root)
+            patches = self._patch_dependencies(root)
+            FakeCandidate.run_reason = "stall: 3 iterations with no commit"
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                mock.patch(
+                    "teacher_distill.campaign.TeacherEscalationManager.continue_after_stall",
+                    return_value="budget: max-iters",
+                ) as escalate,
+            ):
+                result = TeacherDistillCampaign(request).run()
+
+        self.assertEqual(result.status, CampaignTerminalStatus.BUDGET_EXHAUSTED)
+        escalate.assert_called_once()
+        self.assertEqual(FakeCandidate.instances[-1].kwargs["max_stall"], 3)
+
     def test_audited_forbidden_access_overrides_an_apparent_success(self) -> None:
         with tempfile.TemporaryDirectory(prefix="teacher-campaign-leakage-") as temp_dir:
             root = Path(temp_dir)
             request = self._request(root)
             patches = self._patch_dependencies(root)
             FakeCandidate.emit_violation = True
-            with patches[0], patches[1], patches[2], patches[3]:
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 result = TeacherDistillCampaign(request).run()
 
         self.assertEqual(result.status, CampaignTerminalStatus.TEACHER_LEAKAGE_VIOLATION)
@@ -402,6 +475,16 @@ class TeacherCampaignTest(unittest.TestCase):
                 ]["action_category"],
                 "baseline",
             )
+
+    def test_private_state_root_cannot_contain_candidate_workspace(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-campaign-private-boundary-") as temp_dir:
+            root = Path(temp_dir)
+            request = self._request(root)
+            invalid = TeacherDistillRequest(
+                **{**request.__dict__, "private_root": request.workspace_root}
+            )
+            with self.assertRaisesRegex(ValueError, "disjoint"):
+                TeacherDistillCampaign(invalid)
 
     def test_terminal_reason_mapping_is_explicit(self) -> None:
         cases = {
