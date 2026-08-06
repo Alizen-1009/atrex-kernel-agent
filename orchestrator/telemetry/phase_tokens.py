@@ -81,7 +81,6 @@ def summarize_phase_tokens(
                     "interval_count": 0,
                     "measurement": "unavailable",
                     "reason": "phase_not_observed",
-                    "intervals": [],
                 }
                 for phase in PHASES
             },
@@ -184,7 +183,6 @@ def summarize_phase_tokens(
                 "interval_count": 0,
                 "measurement": "unavailable",
                 "reason": "phase_not_observed",
-                "intervals": [],
             }
             continue
         interval_usages = [_sum_phase_usages(interval) for interval in intervals]
@@ -350,7 +348,6 @@ def aggregate_attempt_tokens(attempts: Sequence[Mapping[str, Any]]) -> dict[str,
                 "interval_count": 0,
                 "measurement": "unavailable",
                 "reason": "phase_not_observed",
-                "intervals": [],
             }
             continue
         aggregate = _sum_phase_usages(usages)
@@ -369,7 +366,6 @@ def aggregate_attempt_tokens(attempts: Sequence[Mapping[str, Any]]) -> dict[str,
             "interval_count": interval_count,
             "measurement": aggregate.measurement,
             "reason": None,
-            "intervals": [],
         }
 
     displayed_attributed = _sum_phase_usages(phase_aggregates)

@@ -72,12 +72,13 @@ class EpisodeTelemetryTests(unittest.TestCase):
         )
         implementation = tokens["phases"]["implementation"]
         self.assertEqual(implementation["interval_count"], 2)
+        implementation_intervals = summary["phase_intervals"]["implementation"]
         self.assertEqual(
-            [value["usage"]["total_tokens"] for value in implementation["intervals"]],
+            [value["usage"]["total_tokens"] for value in implementation_intervals],
             [4, 6],
         )
         self.assertEqual(
-            [value["invocation"] for value in implementation["intervals"]],
+            [value["invocation"] for value in implementation_intervals],
             [1, 1],
         )
         self.assertEqual(tokens["orchestration"]["total_tokens"], 10)
@@ -118,11 +119,65 @@ class EpisodeTelemetryTests(unittest.TestCase):
         self.assertEqual(summary["invocation_count"], 2)
         self.assertEqual(summary["phase_tokens"]["terminal_usage"]["total_tokens"], 30)
         self.assertEqual(summary["phase_tokens"]["accounted_coverage"], 1.0)
-        self.assertEqual(summary["measurement"], "partial")
+        self.assertEqual(summary["measurement"], "unavailable")
         self.assertIn(
             "same_session_resume_usage_semantics_unqualified",
             summary["reason_codes"],
         )
+
+    def test_terminal_only_backend_keeps_episode_measurement_unavailable(self) -> None:
+        terminal_only = AgentRuntimeCapabilities(
+            terminal_usage=True,
+            usage_delta=False,
+            phase_marker_receipt=True,
+            usage_delta_observed=False,
+        )
+        observation = InvocationObservation(
+            terminal_usage=usage(500),
+            events=(NormalizedAgentEvent(0, "terminal_usage", usage=usage(500)),),
+            capabilities=terminal_only,
+        )
+
+        summary = summarize_episode(
+            episode=1,
+            version=1,
+            status="pivot",
+            accepted=False,
+            control_tokens=500,
+            resume_count=0,
+            invocations=(observation,),
+        )
+
+        self.assertEqual(summary["measurement"], "unavailable")
+        self.assertEqual(summary["phase_tokens"]["measurement"], "unavailable")
+        self.assertEqual(summary["phase_tokens"]["unattributed"]["total_tokens"], 500)
+        self.assertIn("backend_has_no_usage_delta", summary["reason_codes"])
+
+    def test_unavailable_interval_is_not_exposed_as_phase_detail(self) -> None:
+        observation = InvocationObservation(
+            terminal_usage=usage(10),
+            events=(
+                marker(0, "planning", "start"),
+                NormalizedAgentEvent(1, "usage_delta", usage=TokenUsage.unavailable()),
+                marker(2, "planning", "end"),
+            ),
+            capabilities=CAPABILITIES,
+        )
+
+        summary = summarize_episode(
+            episode=1,
+            version=1,
+            status="pivot",
+            accepted=False,
+            control_tokens=10,
+            resume_count=0,
+            invocations=(observation,),
+        )
+
+        planning = summary["phase_tokens"]["phases"]["planning"]
+        self.assertIsNone(planning["usage"])
+        self.assertEqual(planning["interval_count"], 0)
+        self.assertEqual(summary["phase_intervals"]["planning"], [])
 
     def test_missing_structured_observation_preserves_control_total_as_unattributed(self) -> None:
         summary = summarize_episode(

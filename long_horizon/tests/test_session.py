@@ -30,9 +30,11 @@ class SessionRecoveryTests(unittest.TestCase):
             workspace = Path(temp)
             handoff = workspace / "handoff.json"
             commands: list[list[str]] = []
+            attempt_ids: list[str | None] = []
 
             def execute(command, cwd, timeout, environment):
                 commands.append(command)
+                attempt_ids.append(environment.get("ATREX_TELEMETRY_ATTEMPT_ID"))
                 if len(commands) == 2:
                     atomic_write_json(handoff, {"status": "pivot"})
                 return "", "", 0, False
@@ -51,11 +53,15 @@ class SessionRecoveryTests(unittest.TestCase):
                     handoff_path=handoff,
                     handoff_resumes=2,
                     completion_check=lambda value: "",
+                    telemetry_environment={
+                        "ATREX_TELEMETRY_ATTEMPT_ID": "invocation"
+                    },
                 )
             self.assertEqual(result.resume_count, 1)
             self.assertEqual(result.handoff.status, "pivot")
             self.assertEqual(commands[0][2], commands[1][2])
             self.assertEqual(commands[1][1], "--resume")
+            self.assertEqual(attempt_ids, ["invocation-1", "invocation-2"])
 
     def test_nonzero_exit_does_not_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

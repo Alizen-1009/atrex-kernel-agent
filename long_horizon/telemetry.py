@@ -31,7 +31,11 @@ def _fallback_phase_tokens(control_tokens: int) -> dict[str, Any]:
     return summarize_phase_tokens(
         events=(),
         terminal_usage=terminal,
-        capabilities=AgentRuntimeCapabilities(False, False, False),
+        capabilities=AgentRuntimeCapabilities(
+            terminal_usage=False,
+            usage_delta=False,
+            phase_marker_receipt=False,
+        ),
         observation_errors=("structured_usage_unavailable",),
     )
 
@@ -48,12 +52,12 @@ def summarize_episode(
 ) -> dict[str, Any]:
     """Summarize one episode without changing its existing control-token contract."""
     invocation_summaries: list[dict[str, Any]] = []
-    for index, invocation in enumerate(invocations, start=1):
+    for index, observation in enumerate(invocations, start=1):
         phase_tokens = summarize_phase_tokens(
-            events=invocation.events,
-            terminal_usage=invocation.terminal_usage,
-            capabilities=invocation.capabilities,
-            observation_errors=invocation.observation_errors,
+            events=observation.events,
+            terminal_usage=observation.terminal_usage,
+            capabilities=observation.capabilities,
+            observation_errors=observation.observation_errors,
         )
         invocation_summaries.append(
             {
@@ -68,35 +72,38 @@ def summarize_episode(
         if invocation_summaries
         else _fallback_phase_tokens(control_tokens)
     )
-    aggregate_phases = phase_tokens.get("phases")
-    if isinstance(aggregate_phases, Mapping):
+    phase_intervals: dict[str, list[dict[str, Any]]] = {
+        phase: [] for phase in PHASES
+    }
+    for invocation_summary in invocation_summaries:
+        invocation_number = int(invocation_summary["invocation"])
+        invocation_tokens = invocation_summary.get("phase_tokens")
+        invocation_tokens = (
+            invocation_tokens if isinstance(invocation_tokens, Mapping) else {}
+        )
+        invocation_phases = invocation_tokens.get("phases")
+        invocation_phases = (
+            invocation_phases if isinstance(invocation_phases, Mapping) else {}
+        )
         for phase in PHASES:
-            intervals: list[dict[str, Any]] = []
-            for invocation_summary in invocation_summaries:
-                invocation = int(invocation_summary["invocation"])
-                invocation_tokens = invocation_summary.get("phase_tokens")
-                invocation_tokens = (
-                    invocation_tokens if isinstance(invocation_tokens, Mapping) else {}
+            phase_payload = invocation_phases.get(phase)
+            phase_payload = phase_payload if isinstance(phase_payload, Mapping) else {}
+            for interval in phase_payload.get("intervals") or []:
+                if not isinstance(interval, Mapping):
+                    continue
+                interval_usage = interval.get("usage")
+                if (
+                    not isinstance(interval_usage, Mapping)
+                    or not isinstance(interval_usage.get("total_tokens"), int)
+                ):
+                    continue
+                phase_intervals[phase].append(
+                    {
+                        "invocation": invocation_number,
+                        "index": interval.get("index"),
+                        "usage": interval_usage,
+                    }
                 )
-                invocation_phases = invocation_tokens.get("phases")
-                invocation_phases = (
-                    invocation_phases if isinstance(invocation_phases, Mapping) else {}
-                )
-                phase_payload = invocation_phases.get(phase)
-                phase_payload = phase_payload if isinstance(phase_payload, Mapping) else {}
-                for interval in phase_payload.get("intervals") or []:
-                    if not isinstance(interval, Mapping):
-                        continue
-                    intervals.append(
-                        {
-                            "invocation": invocation,
-                            "index": interval.get("index"),
-                            "usage": interval.get("usage"),
-                        }
-                    )
-            aggregate_phase = aggregate_phases.get(phase)
-            if isinstance(aggregate_phase, dict):
-                aggregate_phase["intervals"] = intervals
     reasons = set(str(value) for value in phase_tokens.get("reason_codes", []))
     if not invocation_summaries:
         reasons.add("structured_usage_unavailable")
@@ -110,7 +117,7 @@ def summarize_episode(
         reasons.add("control_token_total_mismatch")
 
     measurement = str(phase_tokens.get("measurement") or "unavailable")
-    if invocation_summaries and reasons:
+    if reasons and measurement == "exact":
         measurement = "partial"
     phase_tokens["reason_codes"] = sorted(reasons)
     if reasons and phase_tokens.get("measurement") == "exact":
@@ -127,6 +134,7 @@ def summarize_episode(
         "invocation_count": len(invocation_summaries),
         "invocations": invocation_summaries,
         "phase_tokens": phase_tokens,
+        "phase_intervals": phase_intervals,
         "measurement": measurement,
         "reason_codes": sorted(reasons),
     }
@@ -137,6 +145,10 @@ def render_episode_brief(summary: Mapping[str, Any]) -> str:
     tokens = tokens if isinstance(tokens, Mapping) else {}
     phases = tokens.get("phases")
     phases = phases if isinstance(phases, Mapping) else {}
+    phase_intervals = summary.get("phase_intervals")
+    phase_intervals = (
+        phase_intervals if isinstance(phase_intervals, Mapping) else {}
+    )
 
     def cell(value: object) -> str:
         return f"{value:,}" if isinstance(value, int) else "—"
@@ -185,9 +197,7 @@ def render_episode_brief(summary: Mapping[str, Any]) -> str:
 
     interval_rows: list[str] = []
     for phase in PHASES:
-        payload = phases.get(phase)
-        payload = payload if isinstance(payload, Mapping) else {}
-        for interval in payload.get("intervals") or []:
+        for interval in phase_intervals.get(phase) or []:
             if not isinstance(interval, Mapping):
                 continue
             usage = interval.get("usage")

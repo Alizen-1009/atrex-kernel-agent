@@ -94,6 +94,7 @@ class CampaignStore:
     def archive_telemetry(self, episode: int, value: dict[str, Any]) -> Path:
         directory = self.episode_dir(episode)
         path = directory / "telemetry.summary.json"
+        brief = render_episode_brief(value) + "\n"
         atomic_write_json(path, value)
-        atomic_write_text(directory / "telemetry.brief.md", render_episode_brief(value) + "\n")
+        atomic_write_text(directory / "telemetry.brief.md", brief)
         return path

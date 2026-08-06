@@ -82,6 +82,7 @@ class LongSessionRunner:
             environment.update(
                 {str(key): str(value) for key, value in telemetry_environment.items()}
             )
+        telemetry_attempt_prefix = environment.get("ATREX_TELEMETRY_ATTEMPT_ID")
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
         total_tokens = 0
@@ -138,6 +139,10 @@ class LongSessionRunner:
                     else main_adapter.resume_session_command(
                         turn_prompt, active_session_id, reasoning_effort, self.agent_cli
                     )
+                )
+            if telemetry_attempt_prefix:
+                environment["ATREX_TELEMETRY_ATTEMPT_ID"] = (
+                    f"{telemetry_attempt_prefix}-{attempt + 1}"
                 )
             stdout, stderr, exit_status, turn_timed_out = self.executor(
                 command, workspace, remaining, environment
