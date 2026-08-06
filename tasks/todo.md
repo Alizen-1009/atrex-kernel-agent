@@ -66,45 +66,45 @@ Implementation must follow TDD: add a failing behavior test before each producti
 - [x] **Task 11:** Implement `TeacherDistillCampaign` setup, resume locks, loop wiring, and terminal statuses.
   - Depends on: Tasks 6–10
   - Verified: `python3.12 -m unittest teacher_distill.tests.test_campaign teacher_distill.tests.test_stop_policy tests.test_campaign_runtime_binding tests.test_framework_baseline -v`
-- [ ] **Task 12:** Add one bounded long-horizon episode after stalls and one partial restart.
+- [x] **Task 12:** Add one bounded long-horizon episode after stalls and one partial restart.
   - Depends on: Task 11
-  - Verify: `python -m unittest teacher_distill.tests.test_escalation long_horizon.tests.test_campaign long_horizon.tests.test_git_episode -v`
+  - Verified: `python3.12 -m unittest teacher_distill.tests.test_escalation long_horizon.tests.test_campaign long_horizon.tests.test_git_episode long_horizon.tests.test_session -v`
 
 ### Checkpoint D
 
-- [ ] SUCCESS, PLATEAU, BUDGET_EXHAUSTED, INFRA_ERROR, leakage, and resume mismatch are covered.
-- [ ] Candidate HEAD remains monotonically best.
-- [ ] Resume restores escalation/restart counters and deterministic next action.
-- [ ] Existing long-horizon tests remain green.
+- [x] SUCCESS, PLATEAU, BUDGET_EXHAUSTED, INFRA_ERROR, leakage, and resume mismatch are covered.
+- [x] Candidate HEAD remains monotonically best; long-horizon promotion stays ABBA-gated.
+- [x] Resume restores escalation/restart counters and deterministic next action.
+- [x] Existing long-horizon tests remain green.
 
 ## Phase 5 — Evidence-backed distillation
 
-- [ ] **Task 13:** Build deterministic evidence and performance-trajectory manifests.
+- [x] **Task 13:** Build deterministic evidence and performance-trajectory manifests.
   - Depends on: Tasks 11–12
-  - Verify: `python -m unittest teacher_distill.tests.test_evidence -v`
-- [ ] **Task 14:** Generate hypothesis-only Teacher gap analysis and evidence-cited drafts.
+  - Verified: `python3.12 -m unittest teacher_distill.tests.test_evidence -v`
+- [x] **Task 14:** Generate hypothesis-only Teacher gap analysis and evidence-cited drafts.
   - Depends on: Task 13
-  - Verify: `python -m unittest teacher_distill.tests.test_distillation -v`
-- [ ] **Task 15:** Validate drafts and prohibit automatic canonical wiki promotion.
+  - Verified: `python3.12 -m unittest teacher_distill.tests.test_distillation teacher_distill.tests.test_campaign -v`
+- [x] **Task 15:** Validate drafts and prohibit automatic canonical wiki promotion.
   - Depends on: Task 14
-  - Verify: `python -m unittest teacher_distill.tests.test_draft_validator -v`
+  - Verified: `python3.12 -m unittest teacher_distill.tests.test_distillation teacher_distill.tests.test_draft_validator -v`
 
 ## Phase 6 — Documentation and release gate
 
-- [ ] **Task 16:** Add docs, CLI examples, minimal fixtures, and mocked end-to-end test.
+- [x] **Task 16:** Add docs, CLI examples, minimal fixtures, and mocked end-to-end test.
   - Depends on: Tasks 1–15
-- [ ] Run: `python -m unittest discover -s tests -v`
-- [ ] Run: `python -m unittest discover -s long_horizon/tests -v`
-- [ ] Run: `python -m unittest discover -s teacher_distill/tests -v`
-- [ ] Run: `python -m unittest gpu-wiki/scripts/test_query.py -v`
-- [ ] Run: `python -m unittest gpu-wiki/scripts/test_check_self_contained.py -v`
-- [ ] Run: `git diff --check`
+- [ ] Run: `python -m unittest discover -s tests -v` — executed with Python 3.12; feature tests pass, but the base suite has two pre-existing assertion failures and lacks Torch in this local interpreter.
+- [x] Run: `python3.12 -m unittest discover -s long_horizon/tests -v` — 48 passed after wrapper compatibility guard.
+- [x] Run: `python3.12 -m unittest discover -s teacher_distill/tests -v` — 77 passed after final hardening.
+- [x] Run: `python3.12 -m unittest gpu-wiki/scripts/test_query.py -v` — 48 passed.
+- [x] Run: `python3.12 -m unittest gpu-wiki/scripts/test_check_self_contained.py -v` — 47 passed.
+- [x] Run: `git diff --check`.
 
 ### Checkpoint E — Release readiness
 
-- [ ] Standard campaign behavior remains unchanged.
-- [ ] Mocked Teacher campaign passes end to end.
-- [ ] One internal real-GPU smoke campaign passes the checklist in `tasks/plan.md`.
-- [ ] Campaign execution leaves canonical `gpu-wiki/` untouched.
-- [ ] Threat-model wording clearly says `hidden-audited`, not security-grade isolation.
+- [x] Standard campaign behavior remains unchanged in focused characterization/regression tests.
+- [x] Mocked Teacher campaign passes end to end through the real CLI and supervisor.
+- [ ] One internal real-GPU smoke campaign passes the checklist in `tasks/plan.md` — no configured GPU/gateway is available in this environment.
+- [x] Campaign execution leaves canonical `gpu-wiki/` untouched by construction and validator tests.
+- [x] Threat-model wording clearly says `hidden-audited`, not security-grade isolation.
 - [ ] Human review approves the implementation and generated draft format.
