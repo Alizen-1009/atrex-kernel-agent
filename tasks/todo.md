@@ -44,9 +44,9 @@ Implementation must follow TDD: add a failing behavior test before each producti
 - [x] **Task 7:** Enforce sanitized runtime links, search restrictions, forbidden-access audit, and no-public-web policy.
   - Depends on: Tasks 3, 6
   - Verified: `python3.12 -m unittest tests.test_teacher_session_policy tests.test_agent_runtime_interface tests.test_agent_runtime_characterization tests.test_campaign_runtime_binding -v`
-- [ ] **Task 8:** Materialize and validate the private Teacher benchmark workspace.
+- [x] **Task 8:** Materialize and validate the private Teacher benchmark workspace.
   - Depends on: Tasks 1–2, 6
-  - Verify: `python -m unittest teacher_distill.tests.test_teacher_benchmark -v`
+  - Verified: `python3.12 -m unittest teacher_distill.tests.test_bundle teacher_distill.tests.test_teacher_benchmark -v`
 - [ ] **Task 9:** Generalize same-allocation ABBA for private Teacher vs Git Candidate.
   - Depends on: Task 8
   - Verify: `python -m unittest teacher_distill.tests.test_abba long_horizon.tests.test_verifier -v`

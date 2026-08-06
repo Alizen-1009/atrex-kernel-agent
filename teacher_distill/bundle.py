@@ -84,8 +84,10 @@ def _solution_contract(
     if not isinstance(spec, Mapping):
         raise ValueError("solution.json spec must be an object")
     entry_point = spec.get("entry_point")
-    if entry_point != "kernel.py::run":
-        raise ValueError("solution.json entry_point must be kernel.py::run")
+    if entry_point not in {"kernel.py::run", "kernel.py::Model"}:
+        raise ValueError(
+            "solution.json entry_point must be kernel.py::run or kernel.py::Model"
+        )
 
     languages = spec.get("languages")
     if not isinstance(languages, list) or any(not isinstance(item, str) for item in languages):

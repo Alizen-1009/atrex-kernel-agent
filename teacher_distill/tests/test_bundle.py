@@ -149,7 +149,13 @@ class TeacherBundleValidationTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "source path"):
                         validate_teacher_bundle(root, "CuteDSL", "sm90")
 
-    def test_entry_point_must_reference_kernel_run(self) -> None:
+    def test_entry_point_must_reference_supported_kernel_symbol(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="teacher-bundle-model-entry-") as temp_dir:
+            root = Path(temp_dir) / "bundle"
+            self._write_bundle(root, entry_point="kernel.py::Model")
+            bundle = validate_teacher_bundle(root, "CuteDSL", "sm90")
+            self.assertEqual(bundle.entry_point, "kernel.py::Model")
+
         for entry_point in ("helpers/layout.py::run", "kernel.py::main", "kernel.py", "/kernel.py::run"):
             with self.subTest(entry_point=entry_point):
                 with tempfile.TemporaryDirectory(prefix="teacher-bundle-entry-") as temp_dir:
