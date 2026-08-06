@@ -6,9 +6,9 @@ Implementation must follow TDD: add a failing behavior test before each producti
 
 - [x] **Task 1:** Define Teacher campaign schemas and immutable domain models.
   - Verified: `python3 -m unittest teacher_distill.tests.test_models -v`
-- [ ] **Task 2:** Validate and fingerprint self-contained Teacher bundles.
+- [x] **Task 2:** Validate and fingerprint self-contained Teacher bundles.
   - Depends on: Task 1
-  - Verify: `python -m unittest teacher_distill.tests.test_bundle -v`
+  - Verified: `python3.12 -m unittest teacher_distill.tests.test_bundle -v`
 - [ ] **Task 3:** Build a physical, content-addressed sanitized gpu-wiki view.
   - Depends on: Tasks 1–2
   - Verify: `python -m unittest teacher_distill.tests.test_knowledge_view -v`
