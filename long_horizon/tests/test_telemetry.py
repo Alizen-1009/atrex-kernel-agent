@@ -134,7 +134,7 @@ class EpisodeTelemetryTests(unittest.TestCase):
         )
         observation = InvocationObservation(
             terminal_usage=usage(500),
-            events=(NormalizedAgentEvent(0, "terminal_usage", usage=usage(500)),),
+            events=(),
             capabilities=terminal_only,
         )
 
