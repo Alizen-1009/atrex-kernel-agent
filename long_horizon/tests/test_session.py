@@ -30,9 +30,11 @@ class SessionRecoveryTests(unittest.TestCase):
             workspace = Path(temp)
             handoff = workspace / "handoff.json"
             commands: list[list[str]] = []
+            attempt_ids: list[str | None] = []
 
             def execute(command, cwd, timeout, environment):
                 commands.append(command)
+                attempt_ids.append(environment.get("ATREX_TELEMETRY_ATTEMPT_ID"))
                 if len(commands) == 2:
                     atomic_write_json(handoff, {"status": "pivot"})
                 return "", "", 0, False
@@ -51,11 +53,15 @@ class SessionRecoveryTests(unittest.TestCase):
                     handoff_path=handoff,
                     handoff_resumes=2,
                     completion_check=lambda value: "",
+                    telemetry_environment={
+                        "ATREX_TELEMETRY_ATTEMPT_ID": "invocation"
+                    },
                 )
             self.assertEqual(result.resume_count, 1)
             self.assertEqual(result.handoff.status, "pivot")
             self.assertEqual(commands[0][2], commands[1][2])
             self.assertEqual(commands[1][1], "--resume")
+            self.assertEqual(attempt_ids, ["invocation-1", "invocation-2"])
 
     def test_nonzero_exit_does_not_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -263,6 +269,99 @@ class SessionRecoveryTests(unittest.TestCase):
             self.assertEqual(result.resume_count, 1)
             self.assertEqual(result.handoff.status, "pivot")
             self.assertIn(thread_id, commands[1])
+
+    def test_single_invocation_captures_structured_usage_and_marker_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            handoff = workspace / "handoff.json"
+            observed_environment: dict[str, str] = {}
+            receipt = (
+                'ATREX_TRACE_EVENT={"schema":"atrex.iteration_trace.v1",'
+                '"kind":"phase_marker","action":"start","phase":"research",'
+                '"marker_id":"marker-1"}'
+            )
+            stdout = "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "message_update",
+                            "message": {
+                                "role": "assistant",
+                                "usage": {
+                                    "input": 2,
+                                    "output": 3,
+                                    "cacheRead": 5,
+                                    "cacheWrite": 0,
+                                    "totalTokens": 10,
+                                },
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message_end",
+                            "message": {
+                                "role": "assistant",
+                                "usage": {
+                                    "input": 2,
+                                    "output": 3,
+                                    "cacheRead": 5,
+                                    "cacheWrite": 0,
+                                    "totalTokens": 10,
+                                },
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message_end",
+                            "message": {
+                                "role": "toolResult",
+                                "content": [{"type": "text", "text": receipt}],
+                                "usage": {
+                                    "input": 1,
+                                    "output": 1,
+                                    "cacheRead": 3,
+                                    "cacheWrite": 0,
+                                    "totalTokens": 5,
+                                },
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "agent_settled"}),
+                ]
+            )
+
+            def execute(command, cwd, timeout, environment):
+                observed_environment.update(environment)
+                atomic_write_json(handoff, {"status": "pivot"})
+                return stdout, "", 0, False
+
+            with mock.patch(
+                "long_horizon.main_adapter.session_environment", return_value={}
+            ):
+                result = LongSessionRunner(executor=execute, agent_cli="pi").run(
+                    workspace,
+                    "work",
+                    timeout=60,
+                    handoff_path=handoff,
+                    handoff_resumes=0,
+                    completion_check=lambda value: "",
+                    telemetry_environment={"ATREX_TELEMETRY_TRACE": "/tmp/trace.jsonl"},
+                )
+
+            self.assertEqual(result.tokens, 15)
+            self.assertEqual(len(result.invocations), 1)
+            observation = result.invocations[0]
+            self.assertEqual(observation.terminal_usage.total_tokens, 15)
+            self.assertEqual(
+                [event.kind for event in observation.events],
+                ["usage_delta", "usage_delta", "phase_marker", "terminal_usage"],
+            )
+            self.assertTrue(observation.capabilities.usage_delta_observed)
+            self.assertEqual(
+                observed_environment["ATREX_TELEMETRY_TRACE"], "/tmp/trace.jsonl"
+            )
 
     def test_dependency_policy_sigterm_does_not_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

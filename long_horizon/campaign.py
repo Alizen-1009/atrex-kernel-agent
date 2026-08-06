@@ -23,6 +23,7 @@ from .journal import validate_terminal
 from .models import EpisodeHandoff, SupervisorState, VerificationResult
 from .session import LongSessionRunner
 from .store import CampaignStore, RUNTIME_DIR, VERIFY_DIR
+from .telemetry import summarize_episode
 from .verifier import GatewayABBAValidator
 
 
@@ -672,6 +673,14 @@ class LongHorizonCampaign:
                 conversion_pending=conversion_pending,
             )
             store.write_brief(episode, prompt)
+            telemetry_environment = {
+                "ATREX_TELEMETRY_TRACE": str(runtime / "telemetry.jsonl"),
+                "ATREX_TELEMETRY_CAMPAIGN_ID": str(
+                    getattr(self.base_campaign, "campaign_name", self.workspace.name)
+                ),
+                "ATREX_TELEMETRY_ITERATION_ID": f"episode-{episode:04d}",
+                "ATREX_TELEMETRY_ATTEMPT_ID": "invocation",
+            }
             result = runner.run(
                 worktree.path,
                 prompt,
@@ -681,6 +690,7 @@ class LongHorizonCampaign:
                 completion_check=lambda handoff: self._completion_check(
                     worktree, journal_path, handoff
                 ),
+                telemetry_environment=telemetry_environment,
             )
             state.episodes = episode
             state.tokens += result.tokens
@@ -765,6 +775,34 @@ class LongHorizonCampaign:
                 "next_directions": outcome.get("next_directions") if isinstance(outcome, dict) else None,
                 "verification": verification.as_dict() if verification else None,
             }
+            try:
+                telemetry = summarize_episode(
+                    episode=episode,
+                    version=memory_version,
+                    status=status,
+                    accepted=accepted,
+                    control_tokens=result.tokens,
+                    resume_count=result.resume_count,
+                    invocations=result.invocations,
+                )
+                telemetry_path = store.archive_telemetry(episode, telemetry)
+                attempt["telemetry"] = {
+                    "summary": str(telemetry_path.relative_to(store.workspace)),
+                    "measurement": telemetry["measurement"],
+                    "reason_codes": telemetry["reason_codes"],
+                }
+            except Exception as exc:
+                reason_code = f"telemetry_finalize_failed:{type(exc).__name__}"
+                attempt["telemetry"] = {
+                    "summary": None,
+                    "measurement": "unavailable",
+                    "reason_codes": [reason_code],
+                }
+                print(
+                    f"[long-horizon] WARNING: could not finalize episode {episode} "
+                    f"telemetry: {reason_code}",
+                    flush=True,
+                )
             valid_blocked = status == "blocked" and not violation
             if valid_blocked:
                 retry_of = state.attempts[-1] if self._blocked_retry_pending(state) else None

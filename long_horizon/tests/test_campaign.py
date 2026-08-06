@@ -12,6 +12,7 @@ from long_horizon.git_episode import EpisodeWorktree, git_head, record_episode_o
 from long_horizon.journal import append_experiment, finalize
 from long_horizon.models import (
     EpisodeHandoff,
+    InvocationObservation,
     SessionResult,
     VerificationResult,
     VerificationRun,
@@ -19,11 +20,22 @@ from long_horizon.models import (
 from long_horizon.protocol import atomic_write_json
 from long_horizon.store import CampaignStore
 from long_horizon.tests.helpers import init_repo, run_git
+from orchestrator.agent_runtime.model import (
+    AgentRuntimeCapabilities,
+    NormalizedAgentEvent,
+    TokenUsage,
+)
 
 
 class CandidateRunner:
-    def __init__(self, value: int = 5):
+    def __init__(
+        self,
+        value: int = 5,
+        invocations: tuple[InvocationObservation, ...] = (),
+    ):
         self.value = value
+        self.invocations = invocations
+        self.telemetry_environment = None
 
     def run(
         self,
@@ -36,6 +48,7 @@ class CandidateRunner:
         completion_check,
         **kwargs,
     ):
+        self.telemetry_environment = kwargs.get("telemetry_environment")
         (workspace / "kernel.py").write_text(f"VALUE = {self.value}\n", encoding="utf-8")
         run_git(workspace, "add", "kernel.py")
         run_git(workspace, "commit", "-m", "candidate")
@@ -69,6 +82,7 @@ class CandidateRunner:
             session_id="session-1",
             resume_count=0,
             handoff=handoff,
+            invocations=self.invocations,
         )
 
 
@@ -253,11 +267,12 @@ class CampaignIntegrationTests(unittest.TestCase):
             patches = self._patches()
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 base_campaign = fake_base(repo)
+                runner = CandidateRunner(5)
                 reason = LongHorizonCampaign(
                     base_campaign=base_campaign,
                     max_episodes=1,
                     verifier=FixedVerifier(True),
-                    session_runner=CandidateRunner(5),
+                    session_runner=runner,
                     worktree_root=root / "worktrees",
                 ).run()
             self.assertEqual(reason, "max-episodes")
@@ -269,6 +284,111 @@ class CampaignIntegrationTests(unittest.TestCase):
             base_campaign._notify_improvement.assert_called_once()
             base_campaign._notify_iteration.assert_called_once()
             self.assertTrue(base_campaign._notify_iteration.call_args.args[2])
+            self.assertIn("ATREX_TELEMETRY_TRACE", runner.telemetry_environment)
+            telemetry_path = (
+                repo
+                / ".atrex_long_horizon/episodes/e0001/telemetry.summary.json"
+            )
+            telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+            self.assertEqual(telemetry["control_tokens"], 123)
+            self.assertEqual(
+                telemetry["phase_tokens"]["unattributed"]["total_tokens"], 123
+            )
+            self.assertTrue(
+                (repo / ".atrex_long_horizon/episodes/e0001/telemetry.brief.md").is_file()
+            )
+
+    def test_campaign_persists_default_structured_phase_telemetry(self) -> None:
+        usage = lambda total: TokenUsage(total, 0, 0, 0, total, "exact")
+        capabilities = AgentRuntimeCapabilities(True, True, True, True)
+        observation = InvocationObservation(
+            terminal_usage=usage(123),
+            events=(
+                NormalizedAgentEvent(0, "usage_delta", usage=usage(10)),
+                NormalizedAgentEvent(
+                    1, "phase_marker", phase="research", action="start", marker_id="r1"
+                ),
+                NormalizedAgentEvent(2, "usage_delta", usage=usage(20)),
+                NormalizedAgentEvent(
+                    3, "phase_marker", phase="research", action="end", marker_id="r2"
+                ),
+                NormalizedAgentEvent(
+                    4, "phase_marker", phase="recording", action="start", marker_id="w1"
+                ),
+                NormalizedAgentEvent(5, "usage_delta", usage=usage(70)),
+                NormalizedAgentEvent(
+                    6, "phase_marker", phase="recording", action="end", marker_id="w2"
+                ),
+                NormalizedAgentEvent(7, "usage_delta", usage=usage(23)),
+                NormalizedAgentEvent(8, "terminal_usage", usage=usage(123)),
+            ),
+            capabilities=capabilities,
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "campaign"
+            init_repo(repo)
+            patches = self._patches()
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                runner = CandidateRunner(5, invocations=(observation,))
+                LongHorizonCampaign(
+                    base_campaign=fake_base(repo),
+                    max_episodes=1,
+                    verifier=FixedVerifier(True),
+                    session_runner=runner,
+                    worktree_root=root / "worktrees",
+                ).run()
+
+            telemetry = json.loads(
+                (repo / ".atrex_long_horizon/episodes/e0001/telemetry.summary.json").read_text()
+            )
+            tokens = telemetry["phase_tokens"]
+            self.assertEqual(telemetry["control_tokens"], 123)
+            self.assertEqual(tokens["terminal_usage"]["total_tokens"], 123)
+            self.assertEqual(tokens["phases"]["research"]["usage"]["total_tokens"], 30)
+            self.assertEqual(tokens["phases"]["recording"]["usage"]["total_tokens"], 70)
+            self.assertEqual(tokens["orchestration"]["total_tokens"], 23)
+            self.assertEqual(tokens["unattributed"]["total_tokens"], 0)
+            self.assertEqual(tokens["accounted_coverage"], 1.0)
+            self.assertEqual(tokens["reconciliation_status"], "reconciled")
+            self.assertIn("ATREX_TELEMETRY_TRACE", runner.telemetry_environment)
+
+    def test_telemetry_failure_does_not_block_candidate_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "campaign"
+            init_repo(repo)
+            patches = self._patches()
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                mock.patch(
+                    "long_horizon.store.CampaignStore.archive_telemetry",
+                    side_effect=OSError("telemetry disk unavailable"),
+                ),
+            ):
+                reason = LongHorizonCampaign(
+                    base_campaign=fake_base(repo),
+                    max_episodes=1,
+                    verifier=FixedVerifier(True),
+                    session_runner=CandidateRunner(5),
+                    worktree_root=root / "worktrees",
+                ).run()
+
+            self.assertEqual(reason, "max-episodes")
+            self.assertEqual((repo / "kernel.py").read_text(encoding="utf-8"), "VALUE = 5\n")
+            state = json.loads((repo / ".atrex_long_horizon/state.json").read_text())
+            self.assertEqual(state["accepted"], 1)
+            self.assertEqual(
+                state["attempts"][0]["telemetry"]["measurement"], "unavailable"
+            )
+            self.assertEqual(
+                state["attempts"][0]["telemetry"]["reason_codes"],
+                ["telemetry_finalize_failed:OSError"],
+            )
 
     def test_regressing_candidate_never_moves_incumbent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

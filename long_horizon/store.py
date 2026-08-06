@@ -8,6 +8,7 @@ from typing import Any
 from . import main_adapter
 from .models import SupervisorState
 from .protocol import atomic_write_json, atomic_write_text
+from .telemetry import render_episode_brief
 
 
 RUNTIME_DIR = ".atrex_long_horizon"
@@ -88,4 +89,12 @@ class CampaignStore:
     def archive_attempt(self, episode: int, value: dict[str, Any]) -> Path:
         path = self.episode_dir(episode) / "attempt.json"
         atomic_write_json(path, value)
+        return path
+
+    def archive_telemetry(self, episode: int, value: dict[str, Any]) -> Path:
+        directory = self.episode_dir(episode)
+        path = directory / "telemetry.summary.json"
+        brief = render_episode_brief(value) + "\n"
+        atomic_write_json(path, value)
+        atomic_write_text(directory / "telemetry.brief.md", brief)
         return path

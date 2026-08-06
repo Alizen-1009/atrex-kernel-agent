@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from orchestrator.agent_runtime.model import (
+    AgentRuntimeCapabilities,
+    NormalizedAgentEvent,
+    TokenUsage,
+)
+
 
 TERMINAL_STATUSES = frozenset({"candidate_ready", "pivot", "blocked"})
 
@@ -17,6 +23,14 @@ class EpisodeHandoff:
         return {key: value for key, value in asdict(self).items() if value}
 
 
+@dataclass(frozen=True)
+class InvocationObservation:
+    terminal_usage: TokenUsage
+    events: tuple[NormalizedAgentEvent, ...]
+    capabilities: AgentRuntimeCapabilities
+    observation_errors: tuple[str, ...] = ()
+
+
 @dataclass
 class SessionResult:
     exit_status: int
@@ -28,6 +42,7 @@ class SessionResult:
     stdout_tail: str = ""
     stderr_tail: str = ""
     completion_diagnosis: str = ""
+    invocations: tuple[InvocationObservation, ...] = ()
 
 
 @dataclass(frozen=True)

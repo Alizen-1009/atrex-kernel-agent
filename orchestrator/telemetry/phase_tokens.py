@@ -193,6 +193,10 @@ def summarize_phase_tokens(
             "interval_count": len(intervals),
             "measurement": phase_usage.measurement,
             "reason": None,
+            "intervals": [
+                {"index": index, "usage": usage_dict(interval_usage)}
+                for index, interval_usage in enumerate(interval_usages, start=1)
+            ],
         }
 
     attributed = _sum_phase_usages(attributed_usages)
