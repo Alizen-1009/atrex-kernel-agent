@@ -47,9 +47,9 @@ Implementation must follow TDD: add a failing behavior test before each producti
 - [x] **Task 8:** Materialize and validate the private Teacher benchmark workspace.
   - Depends on: Tasks 1–2, 6
   - Verified: `python3.12 -m unittest teacher_distill.tests.test_bundle teacher_distill.tests.test_teacher_benchmark -v`
-- [ ] **Task 9:** Generalize same-allocation ABBA for private Teacher vs Git Candidate.
+- [x] **Task 9:** Generalize same-allocation ABBA for private Teacher vs Git Candidate.
   - Depends on: Task 8
-  - Verify: `python -m unittest teacher_distill.tests.test_abba long_horizon.tests.test_verifier -v`
+  - Verified: `python3.12 -m unittest teacher_distill.tests.test_abba long_horizon.tests.test_verifier -v`
 - [ ] **Task 10:** Implement `TeacherStopPolicy` and Teacher-progress recording.
   - Depends on: Tasks 4–5, 9
   - Verify: `python -m unittest teacher_distill.tests.test_stop_policy -v`
