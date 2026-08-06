@@ -41,9 +41,9 @@ Implementation must follow TDD: add a failing behavior test before each producti
 
 ## Phase 3 — Hidden-audited execution and Teacher measurement
 
-- [ ] **Task 7:** Enforce sanitized runtime links, search restrictions, forbidden-access audit, and no-public-web policy.
+- [x] **Task 7:** Enforce sanitized runtime links, search restrictions, forbidden-access audit, and no-public-web policy.
   - Depends on: Tasks 3, 6
-  - Verify: `python -m unittest tests.test_teacher_session_policy tests.test_agent_runtime_characterization tests.test_campaign_runtime_binding -v`
+  - Verified: `python3.12 -m unittest tests.test_teacher_session_policy tests.test_agent_runtime_interface tests.test_agent_runtime_characterization tests.test_campaign_runtime_binding -v`
 - [ ] **Task 8:** Materialize and validate the private Teacher benchmark workspace.
   - Depends on: Tasks 1–2, 6
   - Verify: `python -m unittest teacher_distill.tests.test_teacher_benchmark -v`

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import shlex
@@ -8,6 +9,9 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
@@ -15,6 +19,46 @@ from typing import Protocol
 DEPENDENCY_GUARD_POLL_SECONDS = 0.25
 DEFAULT_PROTECTED_GATEWAY_SCREEN = "atrex-local-gateway"
 DEFAULT_PROTECTED_GATEWAY_STATE_NAME = "atrex-local-gateway"
+ACCESS_POLICY_ENV = "ATREX_ACCESS_POLICY_ID"
+
+
+@dataclass(frozen=True)
+class ProcessAccessPolicy:
+    forbidden_roots: tuple[Path, ...] = ()
+    network_disabled: bool = False
+    audit_log: Path | None = None
+    label: str = "process-access-policy"
+
+    def __post_init__(self) -> None:
+        roots = tuple(Path(path).expanduser().resolve() for path in self.forbidden_roots)
+        object.__setattr__(self, "forbidden_roots", roots)
+        if self.audit_log is not None:
+            object.__setattr__(self, "audit_log", Path(self.audit_log).expanduser().resolve())
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise ValueError("process access policy label must be non-empty")
+
+
+_ACCESS_POLICIES: dict[str, ProcessAccessPolicy] = {}
+_ACCESS_POLICY_LOCK = threading.Lock()
+
+
+def register_access_policy(policy: ProcessAccessPolicy) -> str:
+    if not isinstance(policy, ProcessAccessPolicy):
+        raise TypeError("policy must be a ProcessAccessPolicy")
+    policy_id = uuid.uuid4().hex
+    with _ACCESS_POLICY_LOCK:
+        _ACCESS_POLICIES[policy_id] = policy
+    return policy_id
+
+
+def unregister_access_policy(policy_id: str) -> None:
+    with _ACCESS_POLICY_LOCK:
+        _ACCESS_POLICIES.pop(policy_id, None)
+
+
+def resolve_access_policy(policy_id: str) -> ProcessAccessPolicy | None:
+    with _ACCESS_POLICY_LOCK:
+        return _ACCESS_POLICIES.get(policy_id)
 
 
 class ProcessRunner(Protocol):
@@ -83,8 +127,11 @@ def python_import_roots(code: str, *, _depth: int = 0) -> set[str]:
     return roots
 
 
-def dependency_process_violation(argv: list[str]) -> str | None:
-    """Describe a forbidden dependency build or host GPU action, if any."""
+def dependency_process_violation(
+    argv: list[str],
+    access_policy: ProcessAccessPolicy | None = None,
+) -> str | None:
+    """Describe a forbidden dependency, host GPU, or scoped-access action."""
     if not argv:
         return None
 
@@ -191,6 +238,42 @@ def dependency_process_violation(argv: list[str]) -> str | None:
         return False
 
     segments = command_segments(argv)
+
+    if access_policy is not None:
+        rendered = " ".join(argv)
+        command_tokens = [*argv, *[token for segment in segments for token in segment]]
+        for root in access_policy.forbidden_roots:
+            root_text = str(root)
+            matched = bool(root_text and root_text in rendered)
+            if not matched:
+                for token in command_tokens:
+                    candidate_text = token.strip("'\"").rstrip(";,)")
+                    if not candidate_text.startswith("/"):
+                        continue
+                    candidate = Path(candidate_text).expanduser().resolve(strict=False)
+                    if candidate == root or root in candidate.parents:
+                        matched = True
+                        break
+            if matched:
+                return "teacher knowledge access policy violation: forbidden path"
+        if access_policy.network_disabled:
+            network_tools = {"curl", "wget", "ssh", "scp", "sftp", "ftp", "nc", "netcat"}
+            git_network_actions = {"clone", "fetch", "pull", "ls-remote", "submodule"}
+            for segment in segments:
+                tokens = unwrap(segment)
+                if not tokens:
+                    continue
+                executable = Path(tokens[0]).name.lower()
+                lowered = [token.lower() for token in tokens]
+                if executable in network_tools:
+                    return "teacher knowledge access policy violation: network access disabled"
+                if executable == "git" and any(action in lowered[1:] for action in git_network_actions):
+                    return "teacher knowledge access policy violation: network access disabled"
+                if re.fullmatch(r"python[0-9.]*", executable) and "-c" in tokens:
+                    code_index = tokens.index("-c") + 1
+                    code = tokens[code_index] if code_index < len(tokens) else ""
+                    if python_import_roots(code) & {"requests", "urllib", "httpx", "aiohttp"}:
+                        return "teacher knowledge access policy violation: network access disabled"
 
     def shared_gateway_mutation(segment: list[str]) -> bool:
         tokens = unwrap(segment)
@@ -308,8 +391,52 @@ def dependency_process_violation(argv: list[str]) -> str | None:
     return None
 
 
+def _ps_descendant_process_commands(root_pid: int) -> list[tuple[int, list[str]]]:
+    """Portable fallback for hosts without Linux procfs (notably macOS)."""
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    children: dict[int, list[tuple[int, list[str]]]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, parent = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        try:
+            argv = shlex.split(parts[2])
+        except ValueError:
+            argv = [parts[2]]
+        children.setdefault(parent, []).append((pid, argv))
+    pending = [root_pid]
+    seen = {root_pid}
+    descendants: list[tuple[int, list[str]]] = []
+    while pending:
+        parent = pending.pop()
+        for pid, argv in children.get(parent, []):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            pending.append(pid)
+            descendants.append((pid, argv))
+    return descendants
+
+
 def descendant_process_commands(root_pid: int) -> list[tuple[int, list[str]]]:
-    """Return live descendants and argv using Linux procfs, tolerating races."""
+    """Return live descendants and argv, preferring Linux procfs."""
+    if not Path(f"/proc/{root_pid}/task").is_dir():
+        return _ps_descendant_process_commands(root_pid)
     pending = [root_pid]
     seen = {root_pid}
     descendants: list[tuple[int, list[str]]] = []
@@ -362,19 +489,44 @@ def signal_process_groups(process_groups: set[int], sig: signal.Signals) -> None
             pass
 
 
+def _record_access_violation(
+    policy: ProcessAccessPolicy | None,
+    reason: str,
+    argv: list[str],
+) -> None:
+    if policy is None or policy.audit_log is None:
+        return
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "policy": policy.label,
+        "reason": reason,
+        "argv": argv[:100],
+    }
+    try:
+        policy.audit_log.parent.mkdir(parents=True, exist_ok=True)
+        with policy.audit_log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
 def dependency_guard(
-    proc: subprocess.Popen[str], stop: threading.Event, violations: list[str]
+    proc: subprocess.Popen[str],
+    stop: threading.Event,
+    violations: list[str],
+    access_policy: ProcessAccessPolicy | None = None,
 ) -> None:
     """Kill a coding session as soon as it starts a forbidden dependency job."""
     while not stop.wait(DEPENDENCY_GUARD_POLL_SECONDS):
         if proc.poll() is not None:
             return
         for pid, argv in descendant_process_commands(proc.pid):
-            reason = dependency_process_violation(argv)
+            reason = dependency_process_violation(argv, access_policy=access_policy)
             if reason is None:
                 continue
             rendered = " ".join(argv)
             violations.append(f"pid={pid}: {reason}: {rendered[:1000]}")
+            _record_access_violation(access_policy, reason, argv)
             process_groups = descendant_process_groups(proc.pid)
             signal_process_groups(process_groups, signal.SIGTERM)
             deadline = time.monotonic() + 1.0
@@ -392,6 +544,10 @@ def run_bounded(
     env: dict | None = None,
 ) -> tuple[str, str, int, bool]:
     """Run a command in its own process group with timeout and policy enforcement."""
+    policy_id = (env or {}).get(ACCESS_POLICY_ENV, "")
+    access_policy = resolve_access_policy(policy_id) if policy_id else None
+    if policy_id and access_policy is None:
+        return "", "[orchestrator] unknown or expired process access policy\n", 126, False
     proc = subprocess.Popen(
         command,
         cwd=str(cwd),
@@ -406,7 +562,7 @@ def run_bounded(
     dependency_violations: list[str] = []
     guard = threading.Thread(
         target=dependency_guard,
-        args=(proc, guard_stop, dependency_violations),
+        args=(proc, guard_stop, dependency_violations, access_policy),
         name=f"dependency-guard-{proc.pid}",
         daemon=True,
     )
@@ -438,6 +594,5 @@ def run_bounded(
             + "\n".join(dependency_violations)
         )
         stderr = (stderr or "") + ("\n" if stderr else "") + policy_message + "\n"
-        if returncode == 0:
-            returncode = 126
+        returncode = 126
     return stdout or "", stderr or "", returncode, timed_out

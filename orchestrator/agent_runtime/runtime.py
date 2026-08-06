@@ -27,7 +27,14 @@ from .model import (
     TokenUsage,
     sum_token_usages,
 )
-from .process import ProcessRunner, protected_gateway_identity, run_bounded
+from .process import (
+    ACCESS_POLICY_ENV,
+    ProcessRunner,
+    protected_gateway_identity,
+    register_access_policy,
+    run_bounded,
+    unregister_access_policy,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -162,12 +169,20 @@ class CliAgentRuntime:
                     for key, value in request.extra_environment.items()
                 }
             )
-        stdout, stderr, exit_status, timed_out = self._process_runner(
-            command,
-            cwd=request.workspace,
-            timeout=request.timeout_s,
-            env=environment,
-        )
+        policy_id = ""
+        if request.access_policy is not None:
+            policy_id = register_access_policy(request.access_policy)
+            environment[ACCESS_POLICY_ENV] = policy_id
+        try:
+            stdout, stderr, exit_status, timed_out = self._process_runner(
+                command,
+                cwd=request.workspace,
+                timeout=request.timeout_s,
+                env=environment,
+            )
+        finally:
+            if policy_id:
+                unregister_access_policy(policy_id)
         observation_errors: tuple[str, ...] = ()
         try:
             events, terminal_usage = self._adapter.normalize_stream(stdout)

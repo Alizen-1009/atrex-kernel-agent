@@ -3,10 +3,60 @@
 
 _atrex_gateway_screen="${ATREX_PROTECTED_GATEWAY_SCREEN:-}"
 _atrex_gateway_state="${ATREX_PROTECTED_GATEWAY_STATE_DIR:-}"
+_atrex_access_policy_id="${ATREX_ACCESS_POLICY_ID:-}"
 
 _atrex_deny_gateway_action() {
     echo "atrex policy: shared localhost gateway lifecycle/state is orchestrator-owned" >&2
     return 126
+}
+
+_atrex_deny_teacher_network() {
+    echo "atrex policy: hidden-Teacher network access is forbidden" >&2
+    return 126
+}
+
+_atrex_teacher_policy_active() {
+    [[ -n "${_atrex_access_policy_id}" ]]
+}
+
+curl() {
+    if _atrex_teacher_policy_active; then _atrex_deny_teacher_network; return $?; fi
+    command curl "$@"
+}
+
+wget() {
+    if _atrex_teacher_policy_active; then _atrex_deny_teacher_network; return $?; fi
+    command wget "$@"
+}
+
+ssh() {
+    if _atrex_teacher_policy_active; then _atrex_deny_teacher_network; return $?; fi
+    command ssh "$@"
+}
+
+scp() {
+    if _atrex_teacher_policy_active; then _atrex_deny_teacher_network; return $?; fi
+    command scp "$@"
+}
+
+sftp() {
+    if _atrex_teacher_policy_active; then _atrex_deny_teacher_network; return $?; fi
+    command sftp "$@"
+}
+
+git() {
+    local value
+    if _atrex_teacher_policy_active; then
+        for value in "$@"; do
+            case "$value" in
+                clone|fetch|pull|ls-remote|submodule)
+                    _atrex_deny_teacher_network
+                    return $?
+                    ;;
+            esac
+        done
+    fi
+    command git "$@"
 }
 
 _atrex_is_gateway_path() {
@@ -250,7 +300,9 @@ python3.10() {
 }
 
 readonly -f _atrex_deny_gateway_action _atrex_is_gateway_path
+readonly -f _atrex_deny_teacher_network _atrex_teacher_policy_active
 readonly -f _atrex_is_tracked_workspace_path _atrex_deny_tracked_delete
+readonly -f curl wget ssh scp sftp git
 readonly -f screen rm rmdir mv truncate pkill killall
 readonly -f _atrex_python_code_imports_blocked_module
 readonly -f _atrex_guarded_python python python3 python3.10

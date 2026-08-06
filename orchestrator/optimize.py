@@ -679,6 +679,7 @@ def run_session(
     sandbox_timeout: int = DEFAULT_SANDBOX_TIMEOUT,
     reasoning_effort: str = "max",
     extra_environment: Optional[dict[str, str]] = None,
+    access_policy: Optional[_agent_runtime.ProcessAccessPolicy] = None,
 ) -> SessionResult:
     """Run one clean coding-agent session with no conversational memory from prior iterations."""
     session_id = str(uuid.uuid4())
@@ -699,6 +700,7 @@ def run_session(
             sandbox_timeout_s=sandbox_timeout,
             session_id=session_id,
             extra_environment=extra_environment,
+            access_policy=access_policy,
         )
     )
     return SessionResult(
@@ -1694,8 +1696,15 @@ def _plan_generator_directive(agent_cli: str, version: int) -> str:
     )
 
 
-def link_runtime(workspace: Path, atrex_bench_root: Optional[Path] = None) -> None:
-    """Make the skill's `tools/`, `reference/`, `skills/`, `reference-projects/`, `gpu-wiki/` resolvable from cwd=workspace.
+def link_runtime(
+    workspace: Path,
+    atrex_bench_root: Optional[Path] = None,
+    *,
+    gpu_wiki_root: Optional[Path] = None,
+    include_reference_projects: bool = True,
+    include_kernel_wiki: bool = True,
+) -> None:
+    """Make the selected optimizer runtime resources resolvable from cwd=workspace.
 
     The gpu-kernel-* skills reference these by relative path; sessions run with cwd=workspace,
     so symlink them in (absolute targets, so the workspace can live anywhere). Idempotent.
@@ -1707,10 +1716,32 @@ def link_runtime(workspace: Path, atrex_bench_root: Optional[Path] = None) -> No
     owns plan generation directly and does not load Humanize. Codex and Pi receive a
     repository-scoped, hydrated Humanize skill without changing global user state.
     """
-    for sub in ("tools", "reference", "skills", "reference-projects", "gpu-wiki"):
-        src, dst = REPO_ROOT / sub, workspace / sub
-        if src.exists() and not dst.exists():
-            os.symlink(src, dst)
+    strict_runtime_links = (
+        gpu_wiki_root is not None or not include_reference_projects or not include_kernel_wiki
+    )
+    runtime_sources = {
+        "tools": REPO_ROOT / "tools",
+        "reference": REPO_ROOT / "reference",
+        "skills": REPO_ROOT / "skills",
+        "gpu-wiki": (gpu_wiki_root or (REPO_ROOT / "gpu-wiki")).resolve(),
+    }
+    if include_reference_projects:
+        runtime_sources["reference-projects"] = REPO_ROOT / "reference-projects"
+    for sub, src in runtime_sources.items():
+        dst = workspace / sub
+        if not src.exists():
+            continue
+        if dst.is_symlink():
+            if dst.resolve() != src.resolve() and strict_runtime_links:
+                raise RuntimeError(
+                    f"workspace runtime link {dst} points at {dst.resolve()}, expected {src.resolve()}"
+                )
+            continue
+        if dst.exists():
+            if strict_runtime_links:
+                raise RuntimeError(f"workspace path blocks the runtime link: {dst}")
+            continue
+        os.symlink(src, dst)
     if atrex_bench_root is not None:
         evaluator = atrex_bench_root / "scripts" / "run_eval.py"
         package = atrex_bench_root / "src" / "atrex_bench"
@@ -1734,7 +1765,12 @@ def link_runtime(workspace: Path, atrex_bench_root: Optional[Path] = None) -> No
     # Claude and Qoder use parallel project-local discovery roots. Keep their contents identical
     # so selecting a different --agent-cli does not change the available optimization knowledge.
     ncu_src = REPO_ROOT / "3rdparty" / "ncu-report-skill"
-    kw_src = REPO_ROOT / "gpu-wiki" / "3rdparty" / "KernelWiki"
+    effective_wiki_root = runtime_sources["gpu-wiki"]
+    kw_src = (
+        effective_wiki_root / "3rdparty" / "KernelWiki"
+        if include_kernel_wiki
+        else Path("/__atrex_kernel_wiki_disabled__")
+    )
     agents_src = REPO_ROOT / "agents"
     for runtime_dir_name in (".claude", ".qoder"):
         runtime_dir = workspace / runtime_dir_name
