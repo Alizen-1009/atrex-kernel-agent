@@ -22,9 +22,9 @@ Implementation must follow TDD: add a failing behavior test before each producti
 
 ## Phase 2 — Backward-compatible orchestration seams
 
-- [ ] **Task 4:** Add optional `teacher_progress` memory/schema/summary support.
+- [x] **Task 4:** Add optional `teacher_progress` memory/schema/summary support.
   - Depends on: Task 1
-  - Verify: `python -m unittest tests.test_teacher_memory -v`
+  - Verified: `python3.12 -m unittest tests.test_teacher_memory -v`
 - [ ] **Task 5:** Add `StopPolicy`/`DefaultStopPolicy` without changing standard campaigns.
   - Depends on: Task 1
   - Verify: `python -m unittest tests.test_stop_policy tests.test_optimize_dispatch tests.test_framework_baseline -v`
