@@ -50,16 +50,16 @@ Implementation must follow TDD: add a failing behavior test before each producti
 - [x] **Task 9:** Generalize same-allocation ABBA for private Teacher vs Git Candidate.
   - Depends on: Task 8
   - Verified: `python3.12 -m unittest teacher_distill.tests.test_abba long_horizon.tests.test_verifier -v`
-- [ ] **Task 10:** Implement `TeacherStopPolicy` and Teacher-progress recording.
+- [x] **Task 10:** Implement `TeacherStopPolicy` and Teacher-progress recording.
   - Depends on: Tasks 4–5, 9
-  - Verify: `python -m unittest teacher_distill.tests.test_stop_policy -v`
+  - Verified: `python3.12 -m unittest teacher_distill.tests.test_stop_policy -v`
 
 ### Checkpoint C
 
-- [ ] Tasks 7–10 pass with fake sandbox responses.
-- [ ] All four Agent backends receive the same Teacher policy environment.
-- [ ] Teacher source/path never appears in public workspace or prompts.
-- [ ] Mocked provisional PASS → ABBA FAIL → continue → ABBA PASS behavior works.
+- [x] Tasks 7–10 pass with fake sandbox responses.
+- [x] All four Agent backends receive the same opaque Teacher policy environment.
+- [x] Teacher source/path never appears in public workspace or prompts in policy tests.
+- [x] Mocked provisional PASS → ABBA FAIL/INFRA → continue and ABBA PASS → stop behavior works.
 
 ## Phase 4 — Complete Teacher campaign and bounded exploration
 
