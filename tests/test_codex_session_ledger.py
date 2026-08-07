@@ -11,6 +11,7 @@ from orchestrator.agent_runtime.codex_ledger import (
     CodexSessionLedgerObserver,
     CodexTemporaryHome,
     codex_thread_id_from_stream,
+    observe_codex_usage,
 )
 from orchestrator.agent_runtime.model import AgentRuntimeCapabilities, TokenUsage
 from orchestrator.telemetry.phase_tokens import summarize_phase_tokens
@@ -201,6 +202,28 @@ class CodexSessionLedgerTests(unittest.TestCase):
                 [event.usage.total_tokens for event in recovered.events if event.kind == "usage_delta"],
                 [10, 7],
             )
+
+    def test_missing_stdout_terminal_keeps_partial_ledger_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self._ledger(home, [token_count(10, 10)])
+            observer = CodexSessionLedgerObserver(home)
+
+            events, terminal, capabilities, errors = observe_codex_usage(
+                observer, THREAD_ID, TokenUsage.unavailable()
+            )
+
+            self.assertEqual(terminal.total_tokens, 10)
+            self.assertEqual(terminal.measurement, "partial")
+            self.assertTrue(capabilities.usage_delta_observed)
+            self.assertTrue(
+                all(
+                    event.usage.measurement == "partial"
+                    for event in events
+                    if event.usage is not None
+                )
+            )
+            self.assertEqual(errors, ("codex_stdout_terminal_unavailable",))
 
     def test_missing_component_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
