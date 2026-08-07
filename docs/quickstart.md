@@ -67,10 +67,7 @@ python orchestrator/optimize.py \
     --agent-cli codex --max-iters 20 --token-budget 8000000
 ```
 
-Each Codex iteration uses `codex exec --json --ephemeral`. The orchestrator installs the required
-optimization and Humanize skills into the campaign's repository-scoped `.agents/skills/` tree; it does
-not modify `${CODEX_HOME}`. Optional Codex config overrides use a JSON object or an array of literal
-`key=value` values:
+Each Codex iteration uses a fresh `codex exec --json` thread. Ordinary mode creates an isolated temporary `CODEX_HOME` with links to the existing auth/config/skills; all newly written rollout and state files remain inside that directory and the whole directory is removed after either successful normalization or terminal-only fallback. The orchestrator uses `session_meta` only to recover the exact workspace/thread when needed, then reads structured token-count and explicit marker records for accounting and verifies every available usage component against `turn.completed.usage`. A cleanup error is recorded without failing the Agent run. Long-horizon mode retains the rollout while same-thread resume remains possible, reads only appended records, and uses cumulative stdout differences if ledger observation fails during a resume. Optimization and Humanize skills stay in the campaign-scoped `.agents/skills/` tree. Optional Codex config overrides use a JSON object or an array of literal `key=value` values:
 
 ```bash
 export ATREX_CODEX_SESSION_SETTINGS='{"model":"gpt-5.6-sol","model_reasoning_effort":"xhigh"}'

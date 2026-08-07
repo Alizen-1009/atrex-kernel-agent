@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-import json
 from dataclasses import replace
 from pathlib import Path
 
 from orchestrator import optimize as base
 from orchestrator.agent_runtime.adapter import DEFAULT_BACKEND_REGISTRY
+from orchestrator.agent_runtime.codex_ledger import (
+    CodexSessionLedgerObserver,
+    codex_thread_id_from_stream,
+    normalized_codex_ledger,
+)
 from orchestrator.agent_runtime.model import (
     AgentRuntimeCapabilities,
     NormalizedAgentEvent,
@@ -94,13 +98,6 @@ def fresh_session_command(
     if agent_cli == "codex":
         if command[:2] != ["codex", "exec"] or command[-1] != prompt:
             raise RuntimeError("current main Codex command has no compatible exec seam")
-        # Main deliberately starts disposable Codex iterations. Long Horizon owns a
-        # different lifecycle: its bounded recovery turns must resume the same thread.
-        # Adapt that policy here instead of changing the main orchestrator command.
-        try:
-            command.remove("--ephemeral")
-        except ValueError:
-            pass
     return command
 
 
@@ -154,17 +151,7 @@ def session_id_from_stream(agent_cli: str, stdout: str, requested_session_id: st
     """
     if agent_cli != "codex":
         return requested_session_id
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict) or event.get("type") != "thread.started":
-            continue
-        thread_id = event.get("thread_id") or event.get("threadId")
-        if isinstance(thread_id, str) and thread_id.strip():
-            return thread_id.strip()
-    return ""
+    return codex_thread_id_from_stream(stdout)
 
 
 def run_bounded(
@@ -178,7 +165,11 @@ def tokens_from_stream(stdout: str) -> int:
 
 
 def normalize_stream(
-    agent_cli: str, stdout: str
+    agent_cli: str,
+    stdout: str,
+    *,
+    session_id: str = "",
+    codex_observer: CodexSessionLedgerObserver | None = None,
 ) -> tuple[
     tuple[NormalizedAgentEvent, ...],
     TokenUsage,
@@ -200,6 +191,15 @@ def normalize_stream(
         adapter.capabilities,
         usage_delta_observed=any(event.kind == "usage_delta" for event in events),
     )
+    if agent_cli == "codex" and codex_observer is not None and session_id:
+        try:
+            events, terminal_usage, capabilities = normalized_codex_ledger(
+                codex_observer, session_id, terminal_usage
+            )
+        except Exception as exc:
+            observation_errors += (
+                f"codex_ledger_unavailable:{type(exc).__name__}",
+            )
     return events, terminal_usage, capabilities, observation_errors
 
 

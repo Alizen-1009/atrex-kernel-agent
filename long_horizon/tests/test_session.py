@@ -9,6 +9,11 @@ from unittest import mock
 
 from long_horizon.protocol import atomic_write_json
 from long_horizon.session import LongSessionRunner
+from orchestrator.agent_runtime.codex_ledger import (
+    CodexLedgerObservation,
+    CodexSessionLedgerObserver,
+)
+from orchestrator.agent_runtime.model import NormalizedAgentEvent, TokenUsage
 
 
 class SessionRecoveryTests(unittest.TestCase):
@@ -239,6 +244,272 @@ class SessionRecoveryTests(unittest.TestCase):
             self.assertEqual(commands[1][:3], ["codex", "exec", "resume"])
             self.assertIn(thread_id, commands[1])
             self.assertNotIn("--ephemeral", commands[0])
+
+    def test_codex_resume_uses_incremental_ledger_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp) / "workspace"
+            workspace.mkdir()
+            home = Path(temp) / "codex-home"
+            handoff = workspace / "handoff.json"
+            thread_id = "019c1234-5678-7abc-8def-0123456789ab"
+            ledger = home / "sessions/2026/08/06" / f"rollout-test-{thread_id}.jsonl"
+            observer = CodexSessionLedgerObserver(home)
+            calls = 0
+
+            def token_record(last, total):
+                return json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": last,
+                                "total_token_usage": total,
+                            },
+                        },
+                    }
+                ) + "\n"
+
+            def execute(command, cwd, timeout, environment):
+                nonlocal calls
+                calls += 1
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                if calls == 1:
+                    ledger.write_text(
+                        token_record(
+                            {"input_tokens": 8, "cached_input_tokens": 6, "cache_write_input_tokens": 1, "output_tokens": 2, "total_tokens": 10},
+                            {"input_tokens": 8, "cached_input_tokens": 6, "cache_write_input_tokens": 1, "output_tokens": 2, "total_tokens": 10},
+                        )
+                    )
+                    stdout = "\n".join(
+                        [
+                            json.dumps({"type": "thread.started", "thread_id": thread_id}),
+                            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 8, "cached_input_tokens": 6, "output_tokens": 2}}),
+                        ]
+                    )
+                    return stdout, "", 0, False
+                with ledger.open("a") as handle:
+                    handle.write(
+                        token_record(
+                            {"input_tokens": 6, "cached_input_tokens": 5, "cache_write_input_tokens": 0, "output_tokens": 1, "total_tokens": 7},
+                            {"input_tokens": 14, "cached_input_tokens": 11, "cache_write_input_tokens": 1, "output_tokens": 3, "total_tokens": 17},
+                        )
+                    )
+                atomic_write_json(handoff, {"status": "pivot"})
+                return json.dumps({"type": "turn.completed", "usage": {"input_tokens": 14, "cached_input_tokens": 11, "output_tokens": 3}}), "", 0, False
+
+            with (
+                mock.patch("long_horizon.main_adapter.session_environment", return_value={}),
+                mock.patch(
+                    "long_horizon.session.CodexSessionLedgerObserver",
+                    return_value=observer,
+                ),
+            ):
+                result = LongSessionRunner(executor=execute, agent_cli="codex").run(
+                    workspace,
+                    "work",
+                    timeout=60,
+                    handoff_path=handoff,
+                    handoff_resumes=1,
+                    completion_check=lambda value: "",
+                )
+
+            self.assertEqual(result.tokens, 17)
+            self.assertEqual(result.resume_count, 1)
+            self.assertEqual(
+                [value.terminal_usage.total_tokens for value in result.invocations],
+                [10, 7],
+            )
+            self.assertTrue(
+                all(value.capabilities.usage_delta_observed for value in result.invocations)
+            )
+            self.assertTrue(
+                all(value.resume_usage_qualified for value in result.invocations)
+            )
+
+    def test_codex_resume_ledger_failure_uses_cumulative_stdout_delta(self) -> None:
+        class FailingSecondObserver:
+            def __init__(self):
+                self.calls = 0
+                self._offset = 0
+                self._session_usage = None
+
+            def observe(self, thread_id):
+                self.calls += 1
+                if self.calls == 2:
+                    raise ValueError("ledger unavailable")
+                usage = TokenUsage(8, 2, 6, 1, 10, "exact")
+                return CodexLedgerObservation(
+                    events=(
+                        NormalizedAgentEvent(0, "usage_delta", usage=usage),
+                        NormalizedAgentEvent(1, "terminal_usage", usage=usage),
+                    ),
+                    terminal_usage=usage,
+                    session_usage=usage,
+                )
+
+            def observe_reconciled(self, thread_id, stream_terminal):
+                return self.observe(thread_id)
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            handoff = workspace / "handoff.json"
+            thread_id = "019c1234-5678-7abc-8def-0123456789ab"
+            calls = 0
+
+            def execute(command, cwd, timeout, environment):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return "\n".join(
+                        [
+                            json.dumps({"type": "thread.started", "thread_id": thread_id}),
+                            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 8, "cached_input_tokens": 6, "output_tokens": 2}}),
+                        ]
+                    ), "", 0, False
+                atomic_write_json(handoff, {"status": "pivot"})
+                return json.dumps({"type": "turn.completed", "usage": {"input_tokens": 14, "cached_input_tokens": 11, "output_tokens": 3}}), "", 0, False
+
+            with (
+                mock.patch("long_horizon.main_adapter.session_environment", return_value={}),
+                mock.patch(
+                    "long_horizon.session.CodexSessionLedgerObserver",
+                    return_value=FailingSecondObserver(),
+                ),
+            ):
+                result = LongSessionRunner(executor=execute, agent_cli="codex").run(
+                    workspace,
+                    "work",
+                    timeout=60,
+                    handoff_path=handoff,
+                    handoff_resumes=1,
+                    completion_check=lambda value: "",
+                )
+
+            self.assertEqual(result.tokens, 17)
+            self.assertEqual(
+                [value.terminal_usage.total_tokens for value in result.invocations],
+                [10, 7],
+            )
+            self.assertIn(
+                "codex_ledger_unavailable:ValueError",
+                result.invocations[1].observation_errors,
+            )
+            self.assertFalse(result.invocations[1].resume_usage_qualified)
+
+    def test_codex_fallback_preserves_last_valid_cumulative_baseline(self) -> None:
+        class FirstOnlyObserver:
+            def __init__(self):
+                self.calls = 0
+                self._offset = 0
+                self._session_usage = None
+
+            def observe(self, thread_id):
+                self.calls += 1
+                if self.calls > 1:
+                    raise ValueError("ledger unavailable")
+                usage = TokenUsage(8, 2, 6, 1, 10, "exact")
+                return CodexLedgerObservation(
+                    events=(
+                        NormalizedAgentEvent(0, "usage_delta", usage=usage),
+                        NormalizedAgentEvent(1, "terminal_usage", usage=usage),
+                    ),
+                    terminal_usage=usage,
+                    session_usage=usage,
+                )
+
+            def observe_reconciled(self, thread_id, stream_terminal):
+                return self.observe(thread_id)
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            handoff = workspace / "handoff.json"
+            thread_id = "019c1234-5678-7abc-8def-0123456789ab"
+            calls = 0
+
+            def execute(command, cwd, timeout, environment):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return "\n".join(
+                        [
+                            json.dumps({"type": "thread.started", "thread_id": thread_id}),
+                            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 8, "cached_input_tokens": 6, "output_tokens": 2}}),
+                        ]
+                    ), "", 0, False
+                if calls == 2:
+                    return json.dumps({"type": "turn.completed", "usage": {"input_tokens": 4, "cached_input_tokens": 3, "output_tokens": 1}}), "", 0, False
+                atomic_write_json(handoff, {"status": "pivot"})
+                return json.dumps({"type": "turn.completed", "usage": {"input_tokens": 14, "cached_input_tokens": 11, "output_tokens": 3}}), "", 0, False
+
+            observer = FirstOnlyObserver()
+            with (
+                mock.patch("long_horizon.main_adapter.session_environment", return_value={}),
+                mock.patch(
+                    "long_horizon.session.CodexSessionLedgerObserver",
+                    return_value=observer,
+                ),
+            ):
+                result = LongSessionRunner(executor=execute, agent_cli="codex").run(
+                    workspace,
+                    "work",
+                    timeout=60,
+                    handoff_path=handoff,
+                    handoff_resumes=2,
+                    completion_check=lambda value: "",
+                )
+
+            self.assertEqual(result.tokens, 17)
+            self.assertEqual(
+                [value.terminal_usage.total_tokens for value in result.invocations],
+                [10, None, 7],
+            )
+            self.assertEqual(observer.calls, 2)
+
+    def test_codex_observer_setup_failure_keeps_long_session_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            handoff = workspace / "handoff.json"
+            thread_id = "019c1234-5678-7abc-8def-0123456789ab"
+
+            def execute(command, cwd, timeout, environment):
+                atomic_write_json(handoff, {"status": "pivot"})
+                return "\n".join(
+                    [
+                        json.dumps({"type": "thread.started", "thread_id": thread_id}),
+                        json.dumps({"type": "turn.completed", "usage": {"input_tokens": 8, "cached_input_tokens": 6, "output_tokens": 2}}),
+                    ]
+                ), "", 0, False
+
+            with (
+                mock.patch("long_horizon.main_adapter.session_environment", return_value={}),
+                mock.patch(
+                    "long_horizon.session.CodexSessionLedgerObserver",
+                    side_effect=PermissionError("ledger inaccessible"),
+                ),
+            ):
+                result = LongSessionRunner(executor=execute, agent_cli="codex").run(
+                    workspace,
+                    "work",
+                    timeout=60,
+                    handoff_path=handoff,
+                    handoff_resumes=0,
+                    completion_check=lambda value: "",
+                )
+
+            self.assertEqual(result.exit_status, 0)
+            self.assertEqual(result.tokens, 10)
+            self.assertEqual(result.handoff.status, "pivot")
+            self.assertIn(
+                "codex_ledger_setup_failed:PermissionError",
+                result.invocations[0].observation_errors,
+            )
 
     def test_codex_sigterm_resumes_observed_thread(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

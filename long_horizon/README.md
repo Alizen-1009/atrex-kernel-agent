@@ -25,7 +25,11 @@ episode in an isolated Git worktree. The episode uses the current main iteration
 many related profile/research/edit/validate/benchmark cycles and private checkpoint commits before
 publishing `candidate_ready`, `pivot`, or `blocked`. Claude and Codex can resume the same session to
 repair an incomplete handoff; Qoder and Pi run a single long invocation because the long-horizon
-adapter does not expose a persistent resume seam for them.
+adapter does not expose a persistent resume seam for them. Codex token deltas and marker ordering are
+read incrementally from that resumable native rollout. Every available invocation component must reconcile
+with the cumulative rollout and `turn.completed` totals before attribution. Reconciled Codex events may form
+one phase interval across a resume boundary; if ledger observation fails, consecutive cumulative stdout
+usage still supplies a non-duplicated invocation total while phase attribution degrades fail-closed.
 
 The incumbent worktree is untouched during exploration. A candidate is promoted only after an exact
 same-allocation ABBA schedule passes correctness and beats the incumbent; promotion is a single squash
